@@ -1,0 +1,209 @@
+"""Top-level verification API.
+
+``verify()`` is the single entry point for receiver-side webhook
+verification. It normalises headers, guards payload size, resolves the
+provider scheme (auto-detected or strict), decodes secrets, and delegates to
+the shared HMAC pipeline.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Mapping, Sequence
+from typing import Final
+
+from ._errors import (
+    ConfigurationError,
+    PayloadTooLargeError,
+    ReplayRejectedError,
+    SignedhookError,
+)
+from ._providers import detect_provider, get_provider
+from ._settings import Settings
+from ._types import VerificationResult
+from .replay import ReplayCache
+
+__all__ = ["UNSET", "UnsetType", "verify", "verify_with_replay"]
+
+logger = logging.getLogger("signedhook.verify")
+
+
+class UnsetType:
+    """Type of the :data:`UNSET` sentinel (do not instantiate)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET: Final[UnsetType] = UnsetType()
+
+
+def _normalize_secrets(secrets: str | Sequence[str]) -> tuple[str, ...]:
+    if isinstance(secrets, str):
+        values: tuple[str, ...] = (secrets,)
+    else:
+        values = tuple(secrets)
+    if not values:
+        raise ConfigurationError("at least one signing secret is required")
+    for value in values:
+        if not isinstance(value, str):
+            raise TypeError("signing secrets must be strings")
+    return values
+
+
+def _normalize_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    return {str(key).lower(): value for key, value in headers.items()}
+
+
+def verify(
+    payload: bytes,
+    headers: Mapping[str, str],
+    *,
+    secrets: str | Sequence[str],
+    provider: str | None = "auto",
+    tolerance: int | None | UnsetType = UNSET,
+    now: int | None = None,
+    settings: Settings | None = None,
+) -> VerificationResult:
+    """Verify a signed webhook payload.
+
+    Args:
+        payload: the raw request body, exactly as received. Must be
+            ``bytes`` — re-encoding a ``str`` invalidates signatures.
+        headers: request headers; keys are matched case-insensitively.
+        secrets: one signing secret or an ordered sequence (rotation: the
+            first secret that verifies wins, its index is reported).
+        provider: ``"auto"`` detects the scheme from headers; a registered
+            name (``"standard"``, ``"stripe"``, ``"github"``, ``"slack"``,
+            ``"shopify"``, ``"razorpay"`` or custom) forces strict mode.
+        tolerance: override the tolerance window in seconds; ``None``
+            disables the timestamp check; leave unset to use
+            :attr:`Settings.tolerance_seconds` (applies only to schemes that
+            sign a timestamp).
+        now: current Unix time in seconds (injectable for tests).
+        settings: limits for this call; defaults to ``Settings()``.
+
+    Returns:
+        VerificationResult with the matched provider, timestamp, secret
+        rotation index and provider message key.
+
+    Raises:
+        TypeError: payload is not ``bytes``.
+        PayloadTooLargeError: payload exceeds ``settings.max_payload_bytes``.
+        UnknownProviderError: no scheme detected, ambiguous headers, or an
+            unknown strict provider name.
+        MissingHeaderError / InvalidHeaderFormatError: scheme headers absent
+            or unparseable.
+        TimestampToleranceExceededError: signed timestamp outside the window.
+        SignatureMismatchError: no secret produced a matching signature.
+        ConfigurationError: invalid secrets or settings.
+    """
+    settings = settings if settings is not None else Settings()
+    if not isinstance(payload, bytes):
+        raise TypeError(
+            "payload must be raw bytes as received, not str — re-encoding invalidates signatures"
+        )
+    if len(payload) > settings.max_payload_bytes:
+        raise PayloadTooLargeError(len(payload), settings.max_payload_bytes)
+
+    lowered = _normalize_headers(headers)
+    secret_values = _normalize_secrets(secrets)
+
+    if provider is None or provider == "auto":
+        scheme = detect_provider(lowered)
+    else:
+        scheme = get_provider(provider)
+
+    if isinstance(tolerance, UnsetType):
+        effective_tolerance = settings.tolerance_seconds
+    else:
+        effective_tolerance = tolerance
+
+    current_time = int(time.time()) if now is None else now
+    keys = tuple(scheme.secret_key(value) for value in secret_values)
+
+    try:
+        result = scheme.verify(
+            payload, lowered, keys, now=current_time, tolerance=effective_tolerance
+        )
+    except SignedhookError as error:
+        logger.debug(
+            "webhook verification failed",
+            extra={
+                "provider": scheme.name,
+                "outcome": "failure",
+                "reason_code": error.code,
+            },
+        )
+        raise
+    logger.debug(
+        "webhook verified",
+        extra={
+            "provider": result.provider,
+            "outcome": "success",
+            "reason_code": "",
+            "matched_secret_index": result.matched_secret_index,
+        },
+    )
+    return result
+
+
+def verify_with_replay(
+    payload: bytes,
+    headers: Mapping[str, str],
+    cache: ReplayCache,
+    *,
+    secrets: str | Sequence[str],
+    provider: str | None = "auto",
+    tolerance: int | None | UnsetType = UNSET,
+    now: int | None = None,
+    settings: Settings | None = None,
+    key: str | None = None,
+    key_header: str | None = None,
+    ttl_seconds: float = 900,
+) -> VerificationResult:
+    """Verify a webhook and reject messages already accepted within ``ttl_seconds``.
+
+    Signature verification runs FIRST; only successfully verified messages
+    consume cache entries, so unauthenticated traffic cannot poison the
+    cache. The dedupe key resolves in this order: explicit ``key``, the
+    ``key_header`` header value (e.g. ``"x-github-delivery"``), then the
+    scheme's own message id (Standard Webhooks ``webhook-id``).
+
+    Args:
+        cache: any object implementing the :class:`ReplayCache` protocol
+            (:class:`MemoryReplayCache` is bundled; Redis-backed caches work
+            too).
+        ttl_seconds: replay window for the cache entries.
+
+    See :func:`verify` for all other parameters and raised errors; raises
+    :class:`ReplayRejectedError` when the key was already accepted, and
+    :class:`ConfigurationError` when no dedupe key can be resolved.
+    """
+    result = verify(
+        payload,
+        headers,
+        secrets=secrets,
+        provider=provider,
+        tolerance=tolerance,
+        now=now,
+        settings=settings,
+    )
+    lowered = _normalize_headers(headers)
+    key_id = key
+    if key_id is None and key_header is not None:
+        key_id = lowered.get(key_header.lower())
+    if key_id is None:
+        key_id = result.message_key
+    if not key_id:
+        raise ConfigurationError(
+            "no replay key available: pass key=, key_header=, or use a scheme that "
+            "signs a message id (standard)"
+        )
+    if cache.seen_within(key_id, ttl_seconds):
+        raise ReplayRejectedError(key_id)
+    cache.remember(key_id, ttl_seconds)
+    return result
