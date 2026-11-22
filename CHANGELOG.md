@@ -3,6 +3,48 @@
 All notable changes to signedhook are documented here. The format follows
 Keep a Changelog; versioning follows Semantic Versioning.
 
+## [1.1.0] — 2026-11-22
+
+Provider coverage and multi-worker replay protection.
+
+### Added
+
+- **Twilio scheme** — `verify_twilio(url, params, headers, secrets=...)` and
+  `sign_twilio(...)`. Twilio signs the request URL plus alphabetically sorted
+  POST parameters (HMAC-SHA1, base64) instead of the raw body, so it gets a
+  dedicated entry point; the registry stub makes `provider="twilio"` and
+  auto-detection fail with a precise, actionable error. Built-in replay
+  support with a content-stable dedupe key (SHA-256 of the string-to-sign).
+- **Legacy GitHub SHA-1 scheme** — `provider="github-legacy"` verifies the
+  `X-Hub-Signature: sha1=...` header. Auto-detection prefers the SHA-256
+  scheme whenever both headers are present; the legacy provider only matches
+  when the modern header is absent.
+- **Configurable digests** — `GenericHMAC(..., digest=...)` accepts
+  `sha1`, `sha256`, `sha384` and `sha512` (`sha256` remains the default);
+  the reported scheme string becomes `hmac-<digest>`. MD5 stays excluded as
+  cryptographically deprecated.
+- **Millisecond timestamps** — `GenericHMAC(..., ts_unit=...)` accepts
+  `seconds` (default), `milliseconds` and `auto` (values >= 10^12 are
+  treated as milliseconds). The signed template always receives the raw
+  value; tolerance checks and `VerificationResult.timestamp` are normalised
+  to seconds.
+- **Shared replay caches for multi-worker deployments** —
+  `RedisReplayCache(client, namespace=...)` works with any Redis-compatible
+  client (one atomic command per operation; `pip install signedhook[redis]`)
+  and `SQLiteReplayCache(path, namespace=...)` is the stdlib-only single-host
+  option (WAL mode, per-worker connections, lazy pruning). Both implement
+  the `ReplayCache` protocol and drop into `verify_with_replay` /
+  `verify_twilio` unchanged.
+- `twilio_string_to_sign(url, params)` helper exposing Twilio's canonical
+  string construction.
+
+### Changed
+
+- The shared HMAC pipeline is digest-parameterised
+  (`_encoding.canonical_hmac`); every built-in provider now reports its
+  digest via `Provider.digest` and its scheme as `hmac-<digest>` where
+  applicable. No behaviour change for existing callers.
+
 ## [1.0.0] — 2026-11-22
 
 Initial release.

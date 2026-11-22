@@ -8,23 +8,100 @@ from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import hmac
+from collections.abc import Sequence
 
 from ._errors import ConfigurationError, InvalidHeaderFormatError
 
 __all__ = [
+    "SUPPORTED_DIGESTS",
+    "SUPPORTED_TIMESTAMP_UNITS",
+    "canonical_hmac",
     "canonical_hmac_sha256",
     "constant_time_eq",
     "decode_secret",
     "decode_signature",
+    "normalize_secret_values",
     "parse_timestamp",
+    "timestamp_to_seconds",
 ]
+
+#: HMAC digest algorithms the shared pipeline accepts. HMAC-SHA1 remains
+#: unbroken as a MAC construction and is required by real schemes (GitHub's
+#: legacy header, Twilio); MD5 is deliberately excluded as cryptographically
+#: deprecated and unused by mainstream webhook providers.
+SUPPORTED_DIGESTS = ("sha1", "sha256", "sha384", "sha512")
+
+#: Units a scheme's signed timestamp may use. ``"auto"`` detects
+#: milliseconds by magnitude (see :data:`MILLISECONDS_THRESHOLD`).
+SUPPORTED_TIMESTAMP_UNITS = ("seconds", "milliseconds", "auto")
+
+#: Timestamps at or above this value are treated as milliseconds under the
+#: ``"auto"`` unit: it equals Unix second 33658-08-19, so no legitimate
+#: seconds timestamp reaches it, while every millisecond timestamp since
+#: 2001-09-09 exceeds it.
+MILLISECONDS_THRESHOLD = 10**12
+
+
+def canonical_hmac(key: bytes, message: bytes, digest: str = "sha256") -> bytes:
+    """Return the raw HMAC of ``message`` under ``key`` using ``digest``.
+
+    Args:
+        key: raw HMAC key bytes.
+        message: the exact signed content.
+        digest: one of :data:`SUPPORTED_DIGESTS` (``"sha1"``, ``"sha256"``,
+            ``"sha384"``, ``"sha512"``). Other values raise
+            :class:`ConfigurationError`.
+    """
+    if digest not in SUPPORTED_DIGESTS:
+        raise ConfigurationError(
+            f"unsupported digest {digest!r}; supported digests are: {', '.join(SUPPORTED_DIGESTS)}"
+        )
+    return hmac.new(key, message, digest).digest()
 
 
 def canonical_hmac_sha256(key: bytes, message: bytes) -> bytes:
     """Return the raw HMAC-SHA256 digest of ``message`` under ``key``."""
-    return hmac.new(key, message, hashlib.sha256).digest()
+    return canonical_hmac(key, message, "sha256")
+
+
+def timestamp_to_seconds(value: int, unit: str = "seconds") -> int:
+    """Normalise a signed timestamp to Unix seconds.
+
+    ``"milliseconds"`` divides by 1000; ``"auto"`` applies magnitude
+    detection (values >= :data:`MILLISECONDS_THRESHOLD` are milliseconds).
+    The raw value is what schemes sign, so providers keep it for content
+    reconstruction while this helper feeds tolerance checks and results.
+    """
+    if unit == "seconds":
+        return value
+    if unit == "milliseconds":
+        return value // 1000
+    if unit == "auto":
+        return value // 1000 if value >= MILLISECONDS_THRESHOLD else value
+    raise ConfigurationError(
+        f"unsupported timestamp unit {unit!r}; supported units are: "
+        f"{', '.join(SUPPORTED_TIMESTAMP_UNITS)}"
+    )
+
+
+def normalize_secret_values(secrets: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalise the ``secrets=`` argument into a validated string tuple.
+
+    Accepts a single secret or an ordered sequence (rotation). Raises
+    :class:`ConfigurationError` for an empty sequence and :class:`TypeError`
+    for non-string members.
+    """
+    if isinstance(secrets, str):
+        values: tuple[str, ...] = (secrets,)
+    else:
+        values = tuple(secrets)
+    if not values:
+        raise ConfigurationError("at least one signing secret is required")
+    for value in values:
+        if not isinstance(value, str):
+            raise TypeError("signing secrets must be strings")
+    return values
 
 
 def constant_time_eq(a: bytes, b: bytes) -> bool:

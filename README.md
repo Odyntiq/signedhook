@@ -4,11 +4,13 @@
 
 `signedhook` is a zero-dependency Python library that verifies webhook
 signature headers for the schemes used by Standard Webhooks / Svix, Stripe,
-GitHub, Slack, Shopify and Razorpay — plus a configurable generic scheme for
-everyone else. Auto-detection, secret rotation, timestamp tolerance windows,
-pluggable replay protection, a retry scheduler for senders and an optional
-FastAPI integration are built in. The core has no third-party dependencies
-and is fully typed (`py.typed`, mypy `--strict` clean).
+GitHub (SHA-256 and legacy SHA-1), Slack, Shopify, Razorpay and Twilio —
+plus a configurable generic scheme (any HMAC digest, second- or
+millisecond-based timestamps) for everyone else. Auto-detection, secret
+rotation, timestamp tolerance windows, pluggable replay protection
+(in-memory, Redis and SQLite backends), a retry scheduler for senders and
+an optional FastAPI integration are built in. The core has no third-party
+dependencies and is fully typed (`py.typed`, mypy `--strict` clean).
 
 ## The problem
 
@@ -17,7 +19,8 @@ each provider's quirky header format — and getting it wrong is the norm:
 
 - GitHub signs the raw body only, Slack signs `v0:{timestamp}:{body}`,
   Stripe signs `{timestamp}.{body}` with comma-separated components,
-  Standard Webhooks signs `{id}.{timestamp}.{body}` with base64 secrets.
+  Standard Webhooks signs `{id}.{timestamp}.{body}` with base64 secrets,
+  Twilio signs the request URL plus sorted form parameters with HMAC-SHA1.
 - Timestamp tolerance (replay defense) is documented but rarely implemented.
 - Secret rotation is almost never handled, so key changes break receivers.
 - Snippets copied from docs compare signatures with `==`, use the wrong
@@ -34,13 +37,14 @@ adapters on top**.
 ## Key features
 
 - **Multi-provider verification** — `standard`, `stripe`, `github`,
-  `slack`, `shopify`, `razorpay`, plus `GenericHMAC` for custom schemes.
+  `github-legacy`, `slack`, `shopify`, `razorpay` and `twilio`, plus
+  `GenericHMAC` for custom schemes.
 - **Auto-detection** — headers decide the scheme; strict mode also available.
 - **Secret rotation** — pass an ordered secret list; the first secret that
   verifies wins and its index is reported.
 - **Replay defense** — timestamp tolerance windows (default 300s, symmetric)
-  plus a `ReplayCache` protocol for message-id dedupe (bundled thread-safe
-  in-memory cache; bring your own Redis backend).
+  plus a `ReplayCache` protocol for message-id dedupe, with thread-safe
+  in-memory, Redis and SQLite backends bundled.
 - **Sender-side signing** — `sign()` produces Standard Webhooks headers for
   round-trip testing and your own emitters.
 - **Retry scheduler** — `RetryPolicy` gives jittered exponential backoff for
@@ -50,7 +54,7 @@ adapters on top**.
 - **Optional FastAPI integration** — a dependency factory that turns
   verification failures into structured HTTP errors (400/401/409/413).
 - **CLI** — `signedhook providers | sign | verify` for debugging and CI.
-- **Quality gates** — pytest (167 tests), ruff, mypy `--strict`, pip-audit,
+- **Quality gates** — pytest (234 tests), ruff, mypy `--strict`, pip-audit,
   CI on Python 3.10–3.13.
 
 ## Provider support matrix
@@ -60,12 +64,16 @@ adapters on top**.
 | Standard Webhooks / Svix | `standard` | `webhook-signature` | `{id}.{ts}.{payload}` | `whsec_` + base64 (raw fallback) | yes |
 | Stripe | `stripe` | `stripe-signature` | `{ts}.{payload}` | `whsec_` prefix stripped | yes |
 | GitHub | `github` | `x-hub-signature-256` | `{payload}` | raw UTF-8 | no |
+| GitHub (legacy) | `github-legacy` | `x-hub-signature` | `{payload}` | raw UTF-8 | no |
 | Slack | `slack` | `x-slack-signature` | `v0:{ts}:{payload}` | raw UTF-8 | yes |
 | Shopify | `shopify` | `x-shopify-hmac-sha256` | `{payload}` | raw UTF-8 | no |
 | Razorpay | `razorpay` | `x-razorpay-signature` | `{payload}` | raw UTF-8 | no |
+| Twilio | `twilio` | `x-twilio-signature` | `{url}` + sorted `key+value` params | raw auth token | no |
 | Custom | registered `GenericHMAC` | configurable | configurable template | configurable | optional |
 
-All schemes are HMAC-SHA256. Signatures are compared in constant time.
+Built-in schemes use HMAC-SHA256 except GitHub legacy and Twilio (HMAC-SHA1,
+per those providers' published schemes); `GenericHMAC` additionally offers
+SHA-384 and SHA-512. Signatures are always compared in constant time.
 
 ## Architecture
 
@@ -84,9 +92,11 @@ VerificationResult ------- provider, timestamp, matched secret index,
 ```
 
 Modules: `verify` (entry point), `_providers/*` (schemes + registry),
-`_encoding` (decode/compare helpers), `replay` (cache protocol), `retry`
-(sender backoff), `signing` (sender side), `fastapi` (optional integration),
-`cli` (shell interface), `_settings` (limits, env support).
+`_encoding` (decode/compare helpers), `replay` (cache protocol),
+`replay_backends` (Redis / SQLite shared caches), `twilio` (URL + params
+scheme), `retry` (sender backoff), `signing` (sender side), `fastapi`
+(optional integration), `cli` (shell interface), `_settings` (limits, env
+support).
 
 ## Installation
 
@@ -95,6 +105,9 @@ pip install signedhook
 
 # with the FastAPI integration
 pip install signedhook[fastapi]
+
+# with the Redis replay backend (SQLite is stdlib-only, no extra needed)
+pip install signedhook[redis]
 ```
 
 Python 3.10+. No dependencies required for the core.
@@ -131,6 +144,26 @@ result = verify(
     tolerance=300,  # seconds; None disables
 )
 ```
+
+### Twilio (URL + form parameters)
+
+Twilio signs the request URL concatenated with the sorted POST parameters,
+not the raw body, so it has a dedicated entry point:
+
+```python
+from signedhook import verify_twilio
+
+result = verify_twilio(
+    request_url,  # exactly as Twilio delivered it
+    form_params,  # dict or list of pairs
+    headers,
+    secrets=TWILIO_AUTH_TOKEN,
+)
+print(result.provider)  # "twilio"
+```
+
+Pass `replay_cache=` for dedupe; the key defaults to a SHA-256 of the
+string-to-sign, stable for identical deliveries.
 
 ### FastAPI receiver
 
@@ -215,9 +248,29 @@ result = verify_with_replay(
 Key resolution order: explicit `key=` → `key_header` value → the scheme's
 own message id (`webhook-id` for Standard Webhooks). Signature verification
 runs **first** — only verified messages consume cache entries, so
-unauthenticated traffic cannot poison the cache. Implement the two-method
-`ReplayCache` protocol against Redis/your database for multi-worker
-deployments.
+unauthenticated traffic cannot poison the cache.
+
+`MemoryReplayCache` is process-local. For multi-worker deployments two
+shared backends ship in the box:
+
+```python
+from signedhook import RedisReplayCache, SQLiteReplayCache, verify_with_replay
+
+# any Redis-compatible client (redis-py, Valkey, KeyDB): atomic per operation
+cache = RedisReplayCache(redis_client, namespace="myapp:replay")
+
+# stdlib-only, single host: pass the same path in every worker
+cache = SQLiteReplayCache("/var/lib/myapp/replay.sqlite3")
+
+result = verify_with_replay(payload, headers, cache, secrets=WHSEC)
+```
+
+`RedisReplayCache` needs any Redis-compatible client
+(`pip install signedhook[redis]`); each operation is a single atomic Redis
+command, so racing workers stay consistent. `SQLiteReplayCache` uses WAL
+mode with a busy timeout and needs no server — ideal for gunicorn/uvicorn
+workers on one machine. Or implement the two-method `ReplayCache` protocol
+against your own database.
 
 ## API overview
 
@@ -225,10 +278,13 @@ deployments.
 |---|---|
 | `verify(payload, headers, *, secrets, provider="auto", tolerance=UNSET, now=None, settings=None)` | Verify a webhook; raises typed errors |
 | `verify_with_replay(..., cache, key=None, key_header=None, ttl_seconds=900)` | Verify + dedupe |
+| `verify_twilio(url, params, headers, *, secrets, replay_cache=None, key=None, ttl_seconds=900)` | Verify Twilio (URL + params scheme) |
 | `sign(payload, *, secret, webhook_id, now=None, scheme="standard")` | Produce sender headers |
+| `sign_twilio(url, params, *, secret)` | Produce Twilio signature headers |
 | `RetryPolicy(...).delays()` | Jittered backoff schedule |
 | `list_providers()` / `get_provider(name)` / `register_provider(provider)` | Registry |
-| `GenericHMAC(name, sig_header, sig_prefix, encoding, secret_prefix, ts_header, signed_template, message_key_header)` | Custom schemes |
+| `GenericHMAC(name, sig_header, sig_prefix, encoding, secret_prefix, base64_secrets, ts_header, signed_template, message_key_header, digest, ts_unit)` | Custom schemes (any digest, seconds/milliseconds) |
+| `MemoryReplayCache` / `RedisReplayCache` / `SQLiteReplayCache` | Replay caches (process-local / Redis / SQLite) |
 | `webhook_dependency(...)` (`signedhook.fastapi`) | FastAPI dependency factory |
 
 Errors (all subclasses of `SignedhookError`, each with a stable `.code`):
@@ -244,7 +300,7 @@ signatures, secrets or payloads.
 
 ```bash
 pip install -e ".[dev]"
-pytest              # 167 tests
+pytest              # 234 tests
 ruff check .
 ruff format --check .
 mypy                # --strict, src only
@@ -264,6 +320,11 @@ the implementation mirroring itself.
 - Size limits are enforced before any HMAC work (cheap DoS guard).
 - Timestamp tolerance is symmetric (past *and* future), default 5 minutes,
   matching the 2026 ecosystem consensus.
+- HMAC-SHA1 appears only where the provider's published scheme requires it
+  (GitHub legacy, Twilio); it is sound as a MAC, and stronger digests are
+  always preferred when the provider offers them (auto-detection picks
+  GitHub SHA-256 over SHA-1 whenever both headers are present). MD5 is not
+  supported.
 - Error messages, logs and CLI output never contain secret material.
 - Replay caches are only populated by *verified* messages.
 
@@ -272,20 +333,18 @@ public issues for security reports.
 
 ## Roadmap
 
-- Twilio adapter (HMAC-SHA1 over URL + sorted params).
-- Async replay-cache adapters (Redis) shipped as extras.
 - Django middleware, Flask decorator.
 - Optional payload-size-aware streaming verification for very large bodies.
+- Async replay-cache adapters for the shared backends.
 
 ## Limitations
 
-- Only HMAC-SHA256 schemes; the legacy GitHub SHA-1 header is intentionally
-  unsupported.
-- Timestamps are Unix seconds (all built-in providers); millisecond schemes
-  need `GenericHMAC` configuration.
-- `MemoryReplayCache` is process-local; multi-worker deployments need a
-  shared `ReplayCache` implementation.
-- Twilio is not yet built in (see roadmap).
+- `MemoryReplayCache` is process-local; use `RedisReplayCache` (any host) or
+  `SQLiteReplayCache` (single host) for multi-worker deployments.
+- Twilio verification needs the original request URL, so it goes through
+  `verify_twilio` rather than the body-only `verify()` pipeline.
+- `SQLiteReplayCache` shares state per database file; multi-host clusters
+  should use `RedisReplayCache`.
 
 ## Contributing
 

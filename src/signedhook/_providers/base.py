@@ -12,7 +12,13 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from .._encoding import canonical_hmac_sha256, constant_time_eq, decode_signature, parse_timestamp
+from .._encoding import (
+    canonical_hmac,
+    constant_time_eq,
+    decode_signature,
+    parse_timestamp,
+    timestamp_to_seconds,
+)
 from .._errors import (
     ConfigurationError,
     InvalidHeaderFormatError,
@@ -51,12 +57,20 @@ class Provider(ABC):
     name: str
     #: Signature scheme identifier reported in results.
     scheme: str = "hmac-sha256"
+    #: HMAC digest the shared pipeline computes (``"sha1"``, ``"sha256"``,
+    #: ``"sha384"`` or ``"sha512"``); must match the provider's scheme.
+    digest: str = "sha256"
     #: Lowercase header names that must all be present for this scheme.
     required_headers: tuple[str, ...] = ()
     #: Lowercase header that carries the signature value.
     signature_header: str = ""
-    #: Lowercase header that carries the Unix-seconds timestamp, if signed.
+    #: Lowercase header that carries the Unix timestamp, if signed.
     timestamp_header: str | None = None
+    #: Unit of the signed timestamp: ``"seconds"``, ``"milliseconds"`` or
+    #: ``"auto"`` (magnitude detection). Tolerance checks and results are
+    #: always normalised to Unix seconds; content reconstruction keeps the
+    #: raw signed value.
+    timestamp_unit: str = "seconds"
 
     @abstractmethod
     def parse_signature(self, headers: HeaderMap) -> ParsedSignature:
@@ -86,24 +100,31 @@ class Provider(ABC):
         """Run the full verification pipeline for this provider.
 
         Order of operations: parse headers (raising precise format errors),
-        reject timestamps outside the tolerance window, then constant-time
-        compare every provided signature against every secret. The first
-        matching secret wins and its position is recorded for rotation
-        bookkeeping.
+        reject timestamps outside the tolerance window (millisecond schemes
+        are normalised to seconds first), then constant-time compare every
+        provided signature against every secret using this scheme's digest.
+        The first matching secret wins and its position is recorded for
+        rotation bookkeeping.
         """
         parsed = self.parse_signature(headers)
         if parsed.timestamp is not None and tolerance is not None:
-            delta = abs(now - parsed.timestamp)
+            delta = abs(now - timestamp_to_seconds(parsed.timestamp, self.timestamp_unit))
             if delta > tolerance:
                 raise TimestampToleranceExceededError(delta, tolerance)
         for position, key in enumerate(secret_keys):
-            expected = canonical_hmac_sha256(key, self.signed_content(payload, headers, parsed))
+            expected = canonical_hmac(
+                key, self.signed_content(payload, headers, parsed), self.digest
+            )
             for provided in parsed.signatures:
                 if constant_time_eq(expected, provided):
                     return VerificationResult(
                         provider=self.name,
                         scheme=self.scheme,
-                        timestamp=parsed.timestamp,
+                        timestamp=(
+                            timestamp_to_seconds(parsed.timestamp, self.timestamp_unit)
+                            if parsed.timestamp is not None
+                            else None
+                        ),
                         matched_secret_index=position,
                         message_key=parsed.message_key,
                         payload_size=len(payload),

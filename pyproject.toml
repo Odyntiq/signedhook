@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signedhook"
-version = "1.0.0"
-description = "Verify signed webhooks from Standard Webhooks, Stripe, GitHub, Slack, Shopify, Razorpay and custom schemes with one call - zero dependencies."
+version = "1.1.0"
+description = "Verify signed webhooks from Standard Webhooks, Stripe, GitHub (SHA-256 + legacy SHA-1), Slack, Shopify, Razorpay, Twilio and custom schemes with one call - zero dependencies."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -22,6 +22,7 @@ keywords = [
   "slack",
   "shopify",
   "razorpay",
+  "twilio",
   "standard-webhooks",
   "svix",
 ]
@@ -42,6 +43,7 @@ dependencies = []
 
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.110"]
+redis = ["redis>=4.5"]
 dev = [
   "pytest>=8",
   "ruff>=0.8",

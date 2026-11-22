@@ -13,6 +13,7 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Final
 
+from ._encoding import normalize_secret_values
 from ._errors import (
     ConfigurationError,
     PayloadTooLargeError,
@@ -41,19 +42,6 @@ class UnsetType:
 UNSET: Final[UnsetType] = UnsetType()
 
 
-def _normalize_secrets(secrets: str | Sequence[str]) -> tuple[str, ...]:
-    if isinstance(secrets, str):
-        values: tuple[str, ...] = (secrets,)
-    else:
-        values = tuple(secrets)
-    if not values:
-        raise ConfigurationError("at least one signing secret is required")
-    for value in values:
-        if not isinstance(value, str):
-            raise TypeError("signing secrets must be strings")
-    return values
-
-
 def _normalize_headers(headers: Mapping[str, str]) -> dict[str, str]:
     return {str(key).lower(): value for key, value in headers.items()}
 
@@ -77,18 +65,22 @@ def verify(
         secrets: one signing secret or an ordered sequence (rotation: the
             first secret that verifies wins, its index is reported).
         provider: ``"auto"`` detects the scheme from headers; a registered
-            name (``"standard"``, ``"stripe"``, ``"github"``, ``"slack"``,
-            ``"shopify"``, ``"razorpay"`` or custom) forces strict mode.
+            name (``"standard"``, ``"stripe"``, ``"github"``,
+            ``"github-legacy"``, ``"slack"``, ``"shopify"``, ``"razorpay"``
+            or custom) forces strict mode. ``"twilio"`` routes to a stub
+            that explains Twilio signs the URL + form parameters — use
+            :func:`signedhook.twilio.verify_twilio` for Twilio requests.
         tolerance: override the tolerance window in seconds; ``None``
             disables the timestamp check; leave unset to use
             :attr:`Settings.tolerance_seconds` (applies only to schemes that
-            sign a timestamp).
+            sign a timestamp; millisecond timestamps are normalised to
+            seconds first).
         now: current Unix time in seconds (injectable for tests).
         settings: limits for this call; defaults to ``Settings()``.
 
     Returns:
-        VerificationResult with the matched provider, timestamp, secret
-        rotation index and provider message key.
+        VerificationResult with the matched provider, timestamp (Unix
+        seconds), secret rotation index and provider message key.
 
     Raises:
         TypeError: payload is not ``bytes``.
@@ -110,7 +102,7 @@ def verify(
         raise PayloadTooLargeError(len(payload), settings.max_payload_bytes)
 
     lowered = _normalize_headers(headers)
-    secret_values = _normalize_secrets(secrets)
+    secret_values = normalize_secret_values(secrets)
 
     if provider is None or provider == "auto":
         scheme = detect_provider(lowered)

@@ -1,13 +1,21 @@
 """Generic configurable HMAC scheme for providers without a built-in adapter.
 
-Many providers sign webhooks with a plain HMAC-SHA256 over a template of the
+Many providers sign webhooks with a plain HMAC over a template of the
 timestamp and payload. :class:`GenericHMAC` lets you describe such a scheme in
-one object and register it, instead of hand-rolling verification code.
+one object and register it, instead of hand-rolling verification code —
+including SHA-1/SHA-256/SHA-384/SHA-512 digests, hex or base64 signatures and
+second- or millisecond-based timestamps.
 """
 
 from __future__ import annotations
 
-from .._encoding import decode_secret, decode_signature, parse_timestamp
+from .._encoding import (
+    SUPPORTED_DIGESTS,
+    SUPPORTED_TIMESTAMP_UNITS,
+    decode_secret,
+    decode_signature,
+    parse_timestamp,
+)
 from .._errors import ConfigurationError, InvalidHeaderFormatError, MissingHeaderError
 from .base import HeaderMap, ParsedSignature, Provider
 
@@ -15,7 +23,7 @@ __all__ = ["GenericHMAC"]
 
 
 class GenericHMAC(Provider):
-    """A configurable HMAC-SHA256 signature scheme.
+    """A configurable HMAC signature scheme (any supported digest).
 
     Args:
         name: registry name to register this scheme under.
@@ -26,13 +34,19 @@ class GenericHMAC(Provider):
         secret_prefix: prefix stripped from secrets (``"whsec_"`` or ``None``).
         base64_secrets: ``True`` forces base64 secret decoding, ``False`` raw
             UTF-8, ``None`` tries base64 then raw.
-        ts_header: lowercase header carrying the Unix-seconds timestamp, or
-            ``None`` when the scheme does not sign one.
+        ts_header: lowercase header carrying the timestamp, or ``None`` when
+            the scheme does not sign one.
         signed_template: format string with ``{ts}`` and/or ``{payload}``
             placeholders describing the signed byte string (e.g.
             ``"{ts}.{payload}"`` or ``"v0:{ts}:{payload}"``). Without a
             timestamp use ``"{payload}"``.
         message_key_header: optional header to surface as the replay key.
+        digest: HMAC digest — ``"sha1"``, ``"sha256"``, ``"sha384"`` or
+            ``"sha512"``; the reported scheme becomes ``hmac-<digest>``.
+        ts_unit: unit of the timestamp header — ``"seconds"`` (default),
+            ``"milliseconds"``, or ``"auto"`` (treat values >= 10^12 as
+            milliseconds). The template always receives the raw signed value;
+            tolerance checks and results are normalised to seconds.
 
     Example:
         >>> provider = GenericHMAC(
@@ -43,6 +57,18 @@ class GenericHMAC(Provider):
         ...     signed_template="{ts}.{payload}",
         ... )
         >>> register_provider(provider)  # doctest: +SKIP
+
+        A millisecond-timestamp, SHA-1, base64 scheme::
+
+            GenericHMAC(
+                name="legacy-vendor",
+                sig_header="x-vendor-signature",
+                encoding="base64",
+                digest="sha1",
+                ts_header="x-vendor-ts",
+                signed_template="{ts}:{payload}",
+                ts_unit="milliseconds",
+            )
     """
 
     def __init__(
@@ -56,6 +82,8 @@ class GenericHMAC(Provider):
         ts_header: str | None = None,
         signed_template: str = "{payload}",
         message_key_header: str | None = None,
+        digest: str = "sha256",
+        ts_unit: str = "seconds",
     ) -> None:
         if not name or not name.strip():
             raise ConfigurationError("GenericHMAC requires a non-empty registry name")
@@ -63,6 +91,12 @@ class GenericHMAC(Provider):
             raise ConfigurationError("sig_header must be a lowercase header name")
         if encoding not in ("hex", "base64"):
             raise ConfigurationError("encoding must be 'hex' or 'base64'")
+        if digest not in SUPPORTED_DIGESTS:
+            raise ConfigurationError(f"digest must be one of: {', '.join(SUPPORTED_DIGESTS)}")
+        if ts_unit not in SUPPORTED_TIMESTAMP_UNITS:
+            raise ConfigurationError(
+                f"ts_unit must be one of: {', '.join(SUPPORTED_TIMESTAMP_UNITS)}"
+            )
         if ts_header is not None and ts_header != ts_header.lower():
             raise ConfigurationError("ts_header must be a lowercase header name")
         if "{payload}" not in signed_template:
@@ -71,7 +105,9 @@ class GenericHMAC(Provider):
             raise ConfigurationError("signed_template uses {ts} but no ts_header was configured")
 
         self.name = name.strip()
-        self.scheme = "hmac-sha256"
+        self.scheme = f"hmac-{digest}"
+        self.digest = digest
+        self.timestamp_unit = ts_unit
         self.signature_header = sig_header
         self.timestamp_header = ts_header
         self._sig_prefix = sig_prefix

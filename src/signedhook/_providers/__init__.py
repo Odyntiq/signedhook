@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from .._errors import UnknownProviderError
+from ..twilio import TwilioProvider
 from .base import HeaderMap, Provider
 from .generic import GenericHMAC
-from .github import GitHubProvider
+from .github import GitHubLegacyProvider, GitHubProvider
 from .razorpay import RazorpayProvider
 from .shopify import ShopifyProvider
 from .slack import SlackProvider
@@ -14,12 +15,14 @@ from .stripe import StripeProvider
 
 __all__ = [
     "GenericHMAC",
+    "GitHubLegacyProvider",
     "GitHubProvider",
     "RazorpayProvider",
     "ShopifyProvider",
     "SlackProvider",
     "StandardWebhooksProvider",
     "StripeProvider",
+    "TwilioProvider",
     "detect_provider",
     "get_provider",
     "list_providers",
@@ -30,9 +33,11 @@ _BUILTIN_PROVIDERS: tuple[Provider, ...] = (
     StandardWebhooksProvider(),
     StripeProvider(),
     GitHubProvider(),
+    GitHubLegacyProvider(),
     SlackProvider(),
     ShopifyProvider(),
     RazorpayProvider(),
+    TwilioProvider(),
 )
 
 _REGISTRY: dict[str, Provider] = {provider.name: provider for provider in _BUILTIN_PROVIDERS}
