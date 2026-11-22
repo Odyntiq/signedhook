@@ -8,6 +8,7 @@ the shared HMAC pipeline.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Mapping, Sequence
@@ -15,12 +16,11 @@ from typing import Final
 
 from ._encoding import normalize_secret_values
 from ._errors import (
-    ConfigurationError,
     PayloadTooLargeError,
-    ReplayRejectedError,
     SignedhookError,
 )
 from ._providers import detect_provider, get_provider
+from ._replay_check import apply_replay, apply_replay_async
 from ._settings import Settings
 from ._types import VerificationResult
 from .replay import AsyncReplayCache, ReplayCache
@@ -190,10 +190,9 @@ def verify_with_replay(
         now=now,
         settings=settings,
     )
-    key_id = _resolve_replay_key(key, key_header, headers, result)
-    if cache.seen_within(key_id, ttl_seconds):
-        raise ReplayRejectedError(key_id)
-    cache.remember(key_id, ttl_seconds)
+    apply_replay(
+        cache, result, key=key, key_header=key_header, headers=headers, ttl_seconds=ttl_seconds
+    )
     return result
 
 
@@ -210,6 +209,7 @@ async def verify_with_replay_async(
     key: str | None = None,
     key_header: str | None = None,
     ttl_seconds: float = 900,
+    offload: bool = False,
 ) -> VerificationResult:
     """Awaitable :func:`verify_with_replay` for asyncio applications.
 
@@ -223,43 +223,39 @@ async def verify_with_replay_async(
     Args:
         cache: any object implementing the :class:`AsyncReplayCache`
             protocol (``await seen_within(...)`` / ``await remember(...)``).
+        offload: run the signature verification in a worker thread via
+            :func:`asyncio.to_thread`. The HMAC over a typical webhook costs
+            microseconds inline and offloading adds a thread hop, so the
+            default is ``False``; pass ``True`` for deployments that accept
+            very large bodies (tens of megabytes and up, via a raised
+            ``max_payload_bytes``) where the inline digest would block the
+            event loop for tens of milliseconds.
 
     See :func:`verify_with_replay` for all other parameters and raised
     errors; the two calls are behaviourally identical.
     """
-    result = verify(
-        payload,
-        headers,
-        secrets=secrets,
-        provider=provider,
-        tolerance=tolerance,
-        now=now,
-        settings=settings,
+    if offload:
+        result = await asyncio.to_thread(
+            verify,
+            payload,
+            headers,
+            secrets=secrets,
+            provider=provider,
+            tolerance=tolerance,
+            now=now,
+            settings=settings,
+        )
+    else:
+        result = verify(
+            payload,
+            headers,
+            secrets=secrets,
+            provider=provider,
+            tolerance=tolerance,
+            now=now,
+            settings=settings,
+        )
+    await apply_replay_async(
+        cache, result, key=key, key_header=key_header, headers=headers, ttl_seconds=ttl_seconds
     )
-    key_id = _resolve_replay_key(key, key_header, headers, result)
-    if await cache.seen_within(key_id, ttl_seconds):
-        raise ReplayRejectedError(key_id)
-    await cache.remember(key_id, ttl_seconds)
     return result
-
-
-def _resolve_replay_key(
-    key: str | None,
-    key_header: str | None,
-    headers: Mapping[str, str],
-    result: VerificationResult,
-) -> str:
-    """Resolve the replay dedupe key: explicit key → header → message id."""
-    key_id = key
-    if key_id is None and key_header is not None:
-        key_id = {str(name).lower(): value for name, value in headers.items()}.get(
-            key_header.lower()
-        )
-    if key_id is None:
-        key_id = result.message_key
-    if not key_id:
-        raise ConfigurationError(
-            "no replay key available: pass key=, key_header=, or use a scheme that "
-            "signs a message id (standard)"
-        )
-    return key_id

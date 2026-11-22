@@ -15,7 +15,12 @@ from django.http import HttpResponse  # noqa: E402
 from django.test import RequestFactory  # noqa: E402
 
 from conftest import GH_SECRET, PAYLOAD, STD_SECRET_HEADER, hmac_sha256_hex  # noqa: E402
-from signedhook import ConfigurationError, MemoryReplayCache, sign  # noqa: E402
+from signedhook import (  # noqa: E402
+    ConfigurationError,
+    MemoryReplayCache,
+    VerificationResult,
+    sign,
+)
 from signedhook.django import WebhookMiddleware  # noqa: E402
 
 
@@ -269,3 +274,214 @@ class TestReplay:
             )
         )
         assert shared.seen_within("msg_factory", 900) is True
+
+
+class TestStreamingRoutes:
+    """ "stream": True — incremental verification with the body restored."""
+
+    STD_STREAM_ROUTE = {
+        "provider": "standard",
+        "secrets": STD_SECRET_HEADER,
+        "tolerance": 300,
+        "stream": True,
+    }
+
+    def test_verified_delivery_restores_body_for_view(self, factory: RequestFactory) -> None:
+        middleware = make_middleware({"/webhooks/std/": dict(self.STD_STREAM_ROUTE)})
+        request = factory.post(
+            "/webhooks/std/",
+            data=PAYLOAD,
+            content_type="application/json",
+            headers=as_django_headers(fresh_std_headers()),
+        )
+        response = middleware(request)
+        assert response.status_code == 200
+        captured = middleware.captured["request"]
+        result = captured.signedhook_result
+        assert result.provider == "standard"
+        assert result.payload_size == len(PAYLOAD)
+        # The view reads the body normally despite the manual stream read.
+        assert captured.body == PAYLOAD
+        # The restored stream is re-readable: read() yields the body again.
+        assert captured.read() == PAYLOAD
+
+    def test_form_parsing_works_after_streaming(self, factory: RequestFactory) -> None:
+        body = b"a=1&b=2"
+        headers = sign(body, secret=STD_SECRET_HEADER, webhook_id="msg_form")
+        middleware = make_middleware({"/webhooks/std/": dict(self.STD_STREAM_ROUTE)})
+
+        def get_response(request: Any) -> HttpResponse:
+            return HttpResponse(
+                json.dumps({"form": dict(request.POST.items())}), content_type="application/json"
+            )
+
+        middleware.get_response = get_response
+        request = factory.post(
+            "/webhooks/std/",
+            data=body,
+            content_type="application/x-www-form-urlencoded",
+            headers=as_django_headers(headers),
+        )
+        response = middleware(request)
+        assert response.status_code == 200
+        assert json.loads(response.content) == {"form": {"a": "1", "b": "2"}}
+
+    def test_tampered_signature_is_401(self, factory: RequestFactory) -> None:
+        middleware = make_middleware({"/webhooks/std/": dict(self.STD_STREAM_ROUTE)})
+        headers = fresh_std_headers()
+        headers["webhook-signature"] = "v1,AAAA"
+        request = factory.post(
+            "/webhooks/std/",
+            data=b'{"event":"tampered"}',
+            content_type="application/json",
+            headers=as_django_headers(headers),
+        )
+        response = middleware(request)
+        assert response.status_code == 401
+        assert detail(response)["code"] == "signature_mismatch"
+
+    def test_oversized_body_is_413(self, factory: RequestFactory) -> None:
+        middleware = make_middleware(
+            {
+                "/webhooks/std/": {
+                    **self.STD_STREAM_ROUTE,
+                    "max_payload_bytes": 256,
+                    "chunk_size": 100,
+                }
+            }
+        )
+        body = b"x" * 1000
+        headers = sign(body, secret=STD_SECRET_HEADER, webhook_id="msg_big")
+        request = factory.post(
+            "/webhooks/std/",
+            data=body,
+            content_type="application/json",
+            headers=as_django_headers(headers),
+        )
+        response = middleware(request)
+        assert response.status_code == 413
+        assert detail(response)["code"] == "payload_too_large"
+
+    def test_replay_is_409(self, factory: RequestFactory) -> None:
+        middleware = make_middleware({"/webhooks/std/": {**self.STD_STREAM_ROUTE, "replay": True}})
+        headers = fresh_std_headers()
+        for _ in range(2):
+            request = factory.post(
+                "/webhooks/std/",
+                data=PAYLOAD,
+                content_type="application/json",
+                headers=as_django_headers(headers),
+            )
+            response = middleware(request)
+        assert response.status_code == 409
+        assert detail(response)["code"] == "replay_rejected"
+
+    def test_chunk_size_one_still_verifies(self, factory: RequestFactory) -> None:
+        middleware = make_middleware({"/webhooks/std/": {**self.STD_STREAM_ROUTE, "chunk_size": 1}})
+        request = factory.post(
+            "/webhooks/std/",
+            data=PAYLOAD,
+            content_type="application/json",
+            headers=as_django_headers(fresh_std_headers()),
+        )
+        assert middleware(request).status_code == 200
+
+    def test_twilio_falls_back_to_buffered_behaviour(self, factory: RequestFactory) -> None:
+        for stream in (False, True):
+            middleware = make_middleware(
+                {"/webhooks/tw/": {"provider": "twilio", "secrets": "token", "stream": stream}}
+            )
+            request = factory.post(
+                "/webhooks/tw/",
+                data=b"a=1",
+                content_type="application/x-www-form-urlencoded",
+                headers={"x-twilio-signature": "AAAA"},
+            )
+            response = middleware(request)
+            assert response.status_code == 500, stream
+            assert detail(response)["code"] == "configuration_error"
+
+    def test_twilio_fallback_enforces_size_cap(self, factory: RequestFactory) -> None:
+        middleware = make_middleware(
+            {
+                "/webhooks/tw/": {
+                    "provider": "twilio",
+                    "secrets": "token",
+                    "stream": True,
+                    "max_payload_bytes": 256,
+                }
+            }
+        )
+        request = factory.post(
+            "/webhooks/tw/",
+            data=b"x" * 400,
+            content_type="application/x-www-form-urlencoded",
+            headers={"x-twilio-signature": "AAAA"},
+        )
+        response = middleware(request)
+        assert response.status_code == 413
+        assert detail(response)["code"] == "payload_too_large"
+
+    def test_stream_option_validation(self) -> None:
+        with pytest.raises(ConfigurationError):
+            make_middleware({"/w/": {"secrets": "s", "stream": "yes"}})
+        with pytest.raises(ConfigurationError):
+            make_middleware({"/w/": {"secrets": "s", "stream": True, "chunk_size": 0}})
+        with pytest.raises(ConfigurationError):
+            make_middleware({"/w/": {"secrets": "s", "stream": True, "chunk_size": True}})
+
+
+class TestScopeTrust:
+    """WebhookMiddleware picks up results pre-verified by the ASGI wrapper."""
+
+    def test_preverified_scope_skips_verification(self, factory: RequestFactory) -> None:
+        middleware = make_middleware({"/webhooks/std/": {"secrets": STD_SECRET_HEADER}})
+        request = factory.post("/webhooks/std/", data=b"{}", content_type="application/json")
+        request.scope = {
+            "signedhook": VerificationResult(  # type: ignore[attr-defined]
+                provider="standard",
+                scheme="hmac-sha256",
+                timestamp=1700000000,
+                matched_secret_index=0,
+                message_key="msg_pre",
+                payload_size=2,
+            )
+        }
+        response = middleware(request)
+        assert response.status_code == 200
+        captured = middleware.captured["request"]
+        assert captured.signedhook_result.message_key == "msg_pre"
+        assert captured._dont_enforce_csrf_checks is True
+
+    def test_scope_with_foreign_value_is_ignored(self, factory: RequestFactory) -> None:
+        middleware = make_middleware({"/webhooks/std/": {"secrets": STD_SECRET_HEADER}})
+        request = factory.post(
+            "/webhooks/std/",
+            data=PAYLOAD,
+            content_type="application/json",
+            headers=as_django_headers(fresh_std_headers(webhook_id="msg_1")),
+        )
+        request.scope = {"signedhook": "not-a-result"}  # type: ignore[attr-defined]
+        # Falls through to normal verification: signature is valid, so 200.
+        assert middleware(request).status_code == 200
+
+
+class TestASGIRequestStreaming:
+    """Stream mode also works for Django's ASGI request objects."""
+
+    def test_asgi_request_stream_route_verifies_and_restores_body(self) -> None:
+        from django.test import AsyncRequestFactory
+
+        middleware = make_middleware({"/webhooks/std/": dict(TestStreamingRoutes.STD_STREAM_ROUTE)})
+        async_factory = AsyncRequestFactory()
+        request = async_factory.post(
+            "/webhooks/std/",
+            data=PAYLOAD,
+            content_type="application/json",
+            headers=as_django_headers(fresh_std_headers()),
+        )
+        response = middleware(request)
+        assert response.status_code == 200
+        captured = middleware.captured["request"]
+        assert captured.signedhook_result.provider == "standard"
+        assert captured.body == PAYLOAD

@@ -3,6 +3,77 @@
 All notable changes to signedhook are documented here. The format follows
 Keep a Changelog; versioning follows Semantic Versioning.
 
+## [1.3.0] — 2026-11-23
+
+Streaming inside the framework integrations — the last 1.0.0 roadmap item
+— plus the remaining addressable limitations.
+
+### Added
+
+- **FastAPI streaming dependency** — `webhook_dependency(..., stream=True)`
+  consumes `request.stream()` (the ASGI receive channel) chunk by chunk:
+  the HMAC state is primed from the headers alone, stale timestamps are
+  rejected before a single body byte is read and the payload-size limit
+  aborts mid-stream. The body is re-injected, so path-operation body
+  parsing keeps working. When the path operation declares body parameters,
+  FastAPI buffers the body before dependencies run; streaming then verifies
+  the cached body chunk by chunk (same semantics, no wire-level abort).
+- **Flask streaming decorator** — `verify_webhook(..., stream=True,
+  chunk_size=64 * 1024)` tees the WSGI input stream into the verifier and
+  re-injects the body, so `request.get_data()`, `request.form` and
+  `request.get_json()` still work in the view.
+- **Django streaming routes** — `"stream": True` (+ `"chunk_size"`) on a
+  `SIGNEDHOOK_ROUTES` entry reads the request stream chunk by chunk instead
+  of via `request.body`, then restores the body so the view sees
+  `request.body` / `request.POST` unchanged. True wire-level streaming on
+  WSGI deployments.
+- **`SignedhookASGIMiddleware`** (`signedhook[django]`) — Django's ASGI
+  handler buffers the whole body before any Django middleware runs, so
+  this wrapper sits around the ASGI application
+  (`application = SignedhookASGIMiddleware(get_asgi_application())`) and
+  verifies matching routes as chunks arrive on `receive()`. Verified
+  deliveries continue with the result stashed in
+  `request.scope["signedhook"]`; `WebhookMiddleware` picks it up, attaches
+  `request.signedhook_result` and skips CSRF. Async replay caches are
+  awaited.
+- **Twilio fallback** — schemes that cannot stream (Twilio signs the URL
+  plus sorted form parameters) transparently fall back to a size-capped
+  buffered read in every streaming integration, so mid-stream size limits
+  still apply to Twilio routes.
+- **`offload=True`** on `verify_with_replay_async`, `verify_twilio_async`
+  and the FastAPI dependency — runs signature verification in a worker
+  thread via `asyncio.to_thread` for deployments accepting very large
+  bodies, where the inline HMAC would block the event loop for tens of
+  milliseconds. Default stays inline (microseconds for typical sizes).
+- **`MemoryReplayCache(maxsize=...)`** — optional LRU bound on the
+  in-memory replay cache (remembering a key refreshes its recency);
+  `AsyncMemoryReplayCache` accepts the same option. Invalid values are
+  rejected with `ConfigurationError`.
+- **Replay-backend selection table** in the README (memory / SQLite /
+  Redis by scope), documenting which backend fits which deployment.
+
+### Changed
+
+- The resolve-check-remember replay sequence is extracted into shared
+  internal helpers (`apply_replay` / `apply_replay_async`), so
+  `verify_with_replay`, its async twin, `StreamingVerifier` and every
+  framework integration share one code path — the verify-first ordering
+  and key-resolution order can no longer drift between entry points.
+- Examples updated: the Flask and FastAPI receivers now use `stream=True`;
+  new runnable `examples/django_asgi_receiver.py` demonstrates the ASGI
+  wrapper end to end.
+
+### Testing
+
+- 378 tests (up from 322): streaming equivalence and error mapping for all
+  three integrations, observability tests proving stale timestamps are
+  rejected with zero body reads and oversized deliveries abort mid-stream
+  (counting WSGI input / ASGI receive channels), ASGI-wrapper pass-through
+  and disconnect behaviour, scope-trust pickup, Twilio fallback parity,
+  `maxsize` LRU eviction and `offload` routing. All four examples are
+  smoke-tested against real servers (flask run / uvicorn) with positive
+  and negative paths.
+
 ## [1.2.0] — 2026-11-23
 
 Framework integrations, async replay protection and streaming verification —

@@ -19,6 +19,7 @@ the signed string, stable for identical deliveries.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -196,16 +197,31 @@ async def verify_twilio_async(
     replay_cache: AsyncReplayCache | None = None,
     key: str | None = None,
     ttl_seconds: float = 900,
+    offload: bool = False,
 ) -> VerificationResult:
     """Awaitable :func:`verify_twilio` for asyncio applications.
 
     Signature verification runs synchronously (pure CPU work); only the two
     cache operations are awaited, so async stores such as
     :class:`~signedhook.replay_backends.AsyncRedisReplayCache` integrate
-    without blocking the event loop. See :func:`verify_twilio` for the
-    arguments and raised errors; the two calls are behaviourally identical.
+    without blocking the event loop.
+
+    Args:
+        offload: run the signature verification in a worker thread via
+            :func:`asyncio.to_thread` — same trade-off as
+            :func:`~signedhook.verify_with_replay_async.offload`; useful when
+            the Twilio form payload is large enough that the inline HMAC
+            would block the event loop.
+
+    See :func:`verify_twilio` for the other arguments and raised errors; the
+    two calls are behaviourally identical.
     """
-    result, content = _twilio_signature_check(url, params, headers, secrets=secrets)
+    if offload:
+        result, content = await asyncio.to_thread(
+            _twilio_signature_check, url, params, headers, secrets=secrets
+        )
+    else:
+        result, content = _twilio_signature_check(url, params, headers, secrets=secrets)
     if replay_cache is not None:
         dedupe_key = key or hashlib.sha256(content).hexdigest()
         if await replay_cache.seen_within(dedupe_key, ttl_seconds):

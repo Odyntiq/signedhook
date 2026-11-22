@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from pathlib import Path
 from typing import Any
@@ -10,7 +11,9 @@ import pytest
 
 from conftest import NOW, PAYLOAD, STD_SECRET_HEADER, std_headers
 from signedhook import (
+    AsyncMemoryReplayCache,
     ConfigurationError,
+    MemoryReplayCache,
     RedisReplayCache,
     ReplayRejectedError,
     SQLiteReplayCache,
@@ -235,3 +238,58 @@ class TestVerifyWithReplayIntegration:
         with pytest.raises(ReplayRejectedError):
             verify_with_replay(PAYLOAD, std_headers(), cache, secrets=STD_SECRET_HEADER, now=NOW)
         cache.close()
+
+
+class TestMemoryReplayCacheMaxsize:
+    """Bounded in-memory caches evict the least recently remembered key."""
+
+    def test_evicts_oldest_when_full(self) -> None:
+        cache = MemoryReplayCache(maxsize=2)
+        cache.remember("a", 60)
+        cache.remember("b", 60)
+        cache.remember("c", 60)
+        assert len(cache) == 2
+        assert cache.seen_within("a", 60) is False  # evicted
+        assert cache.seen_within("b", 60) is True
+        assert cache.seen_within("c", 60) is True
+
+    def test_remember_refreshes_recency(self) -> None:
+        cache = MemoryReplayCache(maxsize=2)
+        cache.remember("a", 60)
+        cache.remember("b", 60)
+        cache.remember("a", 60)  # refresh: "a" is now the most recent
+        cache.remember("c", 60)  # evicts "b", not "a"
+        assert cache.seen_within("a", 60) is True
+        assert cache.seen_within("b", 60) is False
+        assert cache.seen_within("c", 60) is True
+
+    def test_expired_entries_do_not_count_against_maxsize(self) -> None:
+        cache = MemoryReplayCache(maxsize=2)
+        cache.remember("a", 60)
+        cache.remember("b", 0.0)  # expires immediately
+        cache.remember("c", 60)
+        assert len(cache) == 2
+        assert cache.seen_within("a", 60) is True
+        assert cache.seen_within("c", 60) is True
+
+    def test_invalid_maxsize_rejected(self) -> None:
+        for bad in (0, -1, True, "5"):  # type: ignore[arg-type]
+            with pytest.raises(ConfigurationError):
+                MemoryReplayCache(maxsize=bad)
+
+    def test_none_maxsize_is_unbounded(self) -> None:
+        cache = MemoryReplayCache()
+        for i in range(50):
+            cache.remember(f"key-{i}", 60)
+        assert len(cache) == 50
+
+    def test_async_memory_cache_maxsize(self) -> None:
+        async def main() -> None:
+            cache = AsyncMemoryReplayCache(maxsize=1)
+            await cache.remember("a", 60)
+            await cache.remember("b", 60)
+            assert len(cache) == 1
+            assert await cache.seen_within("a", 60) is False
+            assert await cache.seen_within("b", 60) is True
+
+        asyncio.run(main())

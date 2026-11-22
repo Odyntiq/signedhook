@@ -48,9 +48,12 @@ adapters on top**.
   plus sync and async `ReplayCache` protocols for message-id dedupe, with
   thread-safe in-memory, Redis and SQLite backends bundled.
 - **Streaming verification** — `StreamingVerifier` checks very large bodies
-  chunk by chunk with the size limit enforced mid-stream.
+  chunk by chunk with the size limit enforced mid-stream, and the framework
+  integrations feed chunks straight from the ASGI/WSGI request streams
+  (`stream=True`).
 - **Framework integrations** — optional FastAPI dependency, Django
-  middleware and Flask decorator with identical structured error mapping.
+  middleware (+ ASGI wrapper for wire-level streaming) and Flask decorator
+  with identical structured error mapping.
 - **Sender-side signing** — `sign()` produces Standard Webhooks headers for
   round-trip testing and your own emitters.
 - **Retry scheduler** — `RetryPolicy` gives jittered exponential backoff for
@@ -60,7 +63,7 @@ adapters on top**.
 - **Optional FastAPI integration** — a dependency factory that turns
   verification failures into structured HTTP errors (400/401/409/413).
 - **CLI** — `signedhook providers | sign | verify` for debugging and CI.
-- **Quality gates** — pytest (322 tests), ruff, mypy `--strict`, pip-audit,
+- **Quality gates** — pytest (378 tests), ruff, mypy `--strict`, pip-audit,
   CI on Python 3.10–3.13.
 
 ## Provider support matrix
@@ -196,6 +199,12 @@ primed at construction — so unauthenticated requests fail before a single
 body byte is read. `verify_stream(chunks_or_body, headers, ...)` wraps the
 same flow for callers with an iterable (or a complete body).
 
+The framework integrations run this exact pipeline for you: pass
+`stream=True` to the FastAPI dependency or Flask decorator, or set
+`"stream": True` on a Django route (see below). Schemes that cannot stream
+(Twilio) transparently fall back to a size-capped buffered read, so the
+mid-stream size guard still applies.
+
 ### FastAPI receiver
 
 ```python
@@ -207,6 +216,7 @@ verify_hook = webhook_dependency(
     provider="standard",
     secrets=WHSEC,
     replay_cache=MemoryReplayCache(),
+    stream=True,  # verify chunk by chunk off the ASGI receive channel
 )
 
 
@@ -222,7 +232,16 @@ Failures become structured HTTP errors:
 A runnable example lives in [`examples/fastapi_receiver.py`](examples/fastapi_receiver.py).
 
 `replay_cache=` also accepts an async cache (`AsyncReplayCache`); it is
-detected and awaited automatically.
+detected and awaited automatically. With `stream=True` the dependency
+consumes `request.stream()` chunk by chunk (stale timestamps fail before
+any body byte is read; oversized deliveries abort mid-stream) and
+re-injects the body, so body parsing keeps working. One FastAPI nuance:
+when the path operation declares **body parameters**, FastAPI buffers the
+body before dependencies run, so streaming degrades to chunked
+verification of the already-buffered body — routes that take only
+`Request`/`Depends` (like the one above) stream straight off the wire.
+`offload=True` moves buffered verification to a worker thread for very
+large bodies.
 
 ### Flask receiver
 
@@ -234,13 +253,17 @@ app = Flask(__name__)
 
 
 @app.post("/webhooks/stripe")
-@verify_webhook(provider="stripe", secrets=STRIPE_SECRET)
+@verify_webhook(provider="stripe", secrets=STRIPE_SECRET, stream=True)
 def stripe_events(result):
     return {"verified_provider": result.provider}
 ```
 
 Failures return the same structured JSON (`{"detail": {"code", "message"}}`)
-with the same status codes as the FastAPI integration.
+with the same status codes as the FastAPI integration. `stream=True`
+verifies incrementally off the WSGI input stream (64 KiB chunks by
+default, tunable via `chunk_size=`) and re-injects the body, so
+`request.get_data()`, `request.form` and `request.get_json()` still work
+in the view.
 
 ### Django middleware
 
@@ -262,6 +285,12 @@ SIGNEDHOOK_ROUTES = {
         "replay": True,
         "key_header": "x-github-delivery",
     },
+    "/webhooks/large/": {
+        "provider": "standard",
+        "secrets": "env:BIG_WEBHOOK_SECRET",
+        "stream": True,  # verify chunk by chunk, not via request.body
+        "chunk_size": 65536,  # read granularity (default 64 KiB)
+    },
 }
 ```
 
@@ -271,7 +300,39 @@ verified deliveries (webhooks carry no CSRF token). `env:NAME` secrets
 resolve at startup and fail fast; non-matching paths pass through with a
 dict lookup. Per-route options: `provider`, `secrets`, `tolerance`,
 `max_payload_bytes`, `replay` / `replay_cache` (instance or factory),
-`key_header`, `ttl_seconds`.
+`key_header`, `ttl_seconds`, `stream`, `chunk_size`.
+
+With `"stream": True` the body is read chunk by chunk and fed into a
+`StreamingVerifier`: stale timestamps are rejected before any body byte is
+read, the size limit aborts mid-stream, and the body is restored so the
+view still sees `request.body` / `request.POST`. On WSGI deployments this
+streams straight off the socket-backed input; Django's own ASGI handler
+buffers the body before middleware runs, so on ASGI use the wrapper below
+for wire-level streaming.
+
+#### Django + ASGI: wire-level streaming
+
+Django cannot hand middleware an unbuffered ASGI body, so
+`SignedhookASGIMiddleware` wraps the ASGI application itself and verifies
+matching routes as chunks arrive on the `receive()` channel:
+
+```python
+# asgi.py
+import django
+from django.core.asgi import get_asgi_application
+
+from signedhook.django import SignedhookASGIMiddleware
+
+django.setup(set_prefix=False)
+application = SignedhookASGIMiddleware(get_asgi_application())
+```
+
+Keep `WebhookMiddleware` installed as well: the wrapper stashes the result
+in `request.scope["signedhook"]` and the middleware picks it up (attaches
+`request.signedhook_result`, skips CSRF), so views and the rest of the
+middleware stack work unchanged. Async replay caches are awaited. A
+runnable example lives in
+[`examples/django_asgi_receiver.py`](examples/django_asgi_receiver.py).
 
 ### CLI
 
@@ -333,8 +394,17 @@ own message id (`webhook-id` for Standard Webhooks). Signature verification
 runs **first** — only verified messages consume cache entries, so
 unauthenticated traffic cannot poison the cache.
 
-`MemoryReplayCache` is process-local. For multi-worker deployments shared
-backends ship in the box — sync and async:
+Choosing a backend:
+
+| Backend | Scope | Best for |
+|---|---|---|
+| `MemoryReplayCache(maxsize=None)` | one process | dev, single-worker apps; `maxsize=` bounds memory |
+| `SQLiteReplayCache(path)` | one host, all workers | gunicorn/uvicorn on one machine, zero infrastructure |
+| `RedisReplayCache(client)` | one Redis, many hosts | multi-host deployments, automatic TTL eviction |
+
+`MemoryReplayCache` is process-local by nature — workers cannot see each
+other's entries — which is why the shared backends ship in the box, sync
+and async:
 
 ```python
 from signedhook import (
@@ -365,8 +435,11 @@ racing workers stay consistent; the SQLite backends use WAL mode with a
 busy timeout and need no server — ideal for gunicorn/uvicorn workers on
 one machine. The async entry points keep signature verification
 synchronous and only await the two cache operations, so the event loop is
-never blocked. Or implement the two-method `ReplayCache` /
-`AsyncReplayCache` protocols against your own database.
+never blocked; pass `offload=True` to run the verification itself in a
+worker thread (`asyncio.to_thread`) when bodies are large enough that the
+inline HMAC would block for tens of milliseconds. Or implement the
+two-method `ReplayCache` / `AsyncReplayCache` protocols against your own
+database.
 
 ## API overview
 
@@ -386,9 +459,10 @@ never blocked. Or implement the two-method `ReplayCache` /
 | `GenericHMAC(name, sig_header, sig_prefix, encoding, secret_prefix, base64_secrets, ts_header, signed_template, message_key_header, digest, ts_unit)` | Custom schemes (any digest, seconds/milliseconds) |
 | `MemoryReplayCache` / `RedisReplayCache` / `SQLiteReplayCache` | Sync replay caches (process-local / Redis / SQLite) |
 | `AsyncMemoryReplayCache` / `AsyncRedisReplayCache` / `AsyncSQLiteReplayCache` | Async replay caches |
-| `webhook_dependency(...)` (`signedhook.fastapi`) | FastAPI dependency factory |
-| `verify_webhook(...)` (`signedhook.flask`) | Flask view decorator |
-| `WebhookMiddleware` (`signedhook.django`) | Django middleware |
+| `webhook_dependency(...)` (`signedhook.fastapi`) | FastAPI dependency factory (`stream=True`, `offload=True`) |
+| `verify_webhook(...)` (`signedhook.flask`) | Flask view decorator (`stream=True`, `chunk_size=`) |
+| `WebhookMiddleware` (`signedhook.django`) | Django middleware (`"stream": True` routes) |
+| `SignedhookASGIMiddleware` (`signedhook.django`) | ASGI wrapper: wire-level streaming for Django + ASGI |
 
 Errors (all subclasses of `SignedhookError`, each with a stable `.code`):
 `ConfigurationError`, `PayloadTooLargeError`, `MissingHeaderError`,
@@ -403,7 +477,7 @@ signatures, secrets or payloads.
 
 ```bash
 pip install -e ".[dev]"
-pytest              # 322 tests
+pytest              # 378 tests
 ruff check .
 ruff format --check .
 mypy                # --strict, src only
@@ -438,23 +512,30 @@ public issues for security reports.
 
 - More built-in provider schemes (GitLab, Square, Discourse-style
   raw-secret HMAC) as demand warrants.
-- Streaming support inside the framework integrations (feed chunks
-  directly from ASGI/WSGI request streams).
 
 ## Limitations
 
-- `MemoryReplayCache` is process-local; use the Redis or SQLite backends
-  (sync or async) for multi-worker deployments.
-- Streaming verification covers every body-signing scheme; Twilio cannot
-  stream because it signs the request URL and form parameters, not the
-  body.
-- The Django middleware and Flask decorator read the full body before
-  verifying (framework request objects buffer it); for hard pre-HMAC size
-  limits use the web server's request-size cap or the FastAPI integration
-  fed from a streaming body.
-- The async entry points await only the replay-cache operations; HMAC
-  computation is CPU-bound and runs inline (it is fast — microseconds for
-  typical webhook sizes).
+- `MemoryReplayCache` is process-local by design; the bundled SQLite and
+  Redis backends (sync and async, see the selection table above) cover
+  multi-worker and multi-host deployments.
+- Twilio cannot be incrementally HMAC-verified by any receiver: the scheme
+  signs the request URL plus sorted form parameters, which requires the
+  complete body before the signed string can be built. Streaming framework
+  integrations still enforce the payload-size limit mid-stream for Twilio
+  routes via a capped buffered read, then report the scheme error.
+- On Django + ASGI, Django itself buffers the request body before any
+  Django middleware runs — `WebhookMiddleware(stream=True)` cannot see an
+  unbuffered body there. Wrap the ASGI application with
+  `SignedhookASGIMiddleware` for wire-level streaming; that is exactly
+  what it exists for.
+- FastAPI path operations that declare body parameters cause FastAPI to
+  buffer the body before dependencies run; `stream=True` there verifies
+  the cached body chunk by chunk (same semantics, no wire-level abort).
+  Routes without body parameters stream straight off the ASGI channel.
+- The async entry points await the two replay-cache operations; the HMAC
+  itself is CPU-bound and runs inline by default (microseconds for typical
+  webhook sizes). Pass `offload=True` to move it to a worker thread when
+  accepting very large bodies.
 
 ## Contributing
 

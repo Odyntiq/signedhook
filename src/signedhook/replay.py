@@ -13,6 +13,8 @@ import threading
 import time
 from typing import Protocol
 
+from ._errors import ConfigurationError
+
 __all__ = ["AsyncMemoryReplayCache", "AsyncReplayCache", "MemoryReplayCache", "ReplayCache"]
 
 
@@ -54,14 +56,31 @@ class MemoryReplayCache:
     """Single-process, thread-safe in-memory :class:`ReplayCache`.
 
     Each entry expires ``ttl_seconds`` after it was remembered (the TTL
-    given to :meth:`remember`); pruning happens lazily on every operation,
-    which keeps the cache bounded under regular traffic. For multi-worker
-    deployments (gunicorn/uvicorn workers, serverless) implement
-    :class:`ReplayCache` against a shared store instead — process-local
-    caches cannot see each other's entries.
+    given to :meth:`remember`); pruning happens lazily on every operation.
+    Pass ``maxsize`` to bound memory for long-running processes: when the
+    cache holds more than ``maxsize`` live entries, the least recently
+    remembered key is evicted first (remembering a key again refreshes its
+    recency). This is still process-local — workers cannot see each
+    other's entries — so multi-worker deployments (gunicorn/uvicorn workers,
+    serverless) should use :class:`~signedhook.replay_backends.
+    RedisReplayCache` or :class:`~signedhook.replay_backends.
+    SQLiteReplayCache` instead.
+
+    Args:
+        maxsize: maximum number of live entries (``None`` keeps the cache
+            unbounded, relying on TTL pruning alone).
+
+    Raises:
+        ConfigurationError: ``maxsize`` is not a positive integer or ``None``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, maxsize: int | None = None) -> None:
+        invalid = maxsize is not None and (
+            not isinstance(maxsize, int) or isinstance(maxsize, bool) or maxsize < 1
+        )
+        if invalid:
+            raise ConfigurationError(f"maxsize must be a positive integer or None, got {maxsize!r}")
+        self._maxsize = maxsize
         self._entries: dict[str, tuple[float, float]] = {}  # key -> (recorded_at, ttl)
         self._lock = threading.Lock()
 
@@ -79,7 +98,13 @@ class MemoryReplayCache:
         now = time.monotonic()
         with self._lock:
             self._prune(now)
+            # pop-then-store refreshes recency for keys already remembered
+            self._entries.pop(key, None)
             self._entries[key] = (now, ttl_seconds)
+            if self._maxsize is not None:
+                while len(self._entries) > self._maxsize:
+                    oldest = next(iter(self._entries))
+                    del self._entries[oldest]
 
     def discard(self, key: str) -> None:
         """Explicitly forget one key (e.g. after compensating actions)."""
@@ -115,8 +140,10 @@ class AsyncMemoryReplayCache:
         or bring your own async store.
     """
 
-    def __init__(self, inner: MemoryReplayCache | None = None) -> None:
-        self._inner = inner if inner is not None else MemoryReplayCache()
+    def __init__(
+        self, inner: MemoryReplayCache | None = None, *, maxsize: int | None = None
+    ) -> None:
+        self._inner = inner if inner is not None else MemoryReplayCache(maxsize=maxsize)
 
     async def seen_within(self, key: str, ttl_seconds: float) -> bool:
         return self._inner.seen_within(key, ttl_seconds)

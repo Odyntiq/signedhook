@@ -365,3 +365,92 @@ class TestVerifyTwilioAsync:
             assert async_result == sync_result
 
         asyncio.run(main())
+
+
+class TestOffload:
+    """offload=True runs verification in a worker thread; results identical."""
+
+    def test_offload_verifies_and_rejects_replay(self) -> None:
+        async def main() -> None:
+            headers = std_headers()
+            cache = AsyncMemoryReplayCache()
+            result = await verify_with_replay_async(
+                PAYLOAD,
+                headers,
+                cache,
+                secrets=STD_SECRET_HEADER,
+                now=NOW,
+                offload=True,
+            )
+            assert result.provider == "standard"
+            with pytest.raises(ReplayRejectedError):
+                await verify_with_replay_async(
+                    PAYLOAD,
+                    headers,
+                    cache,
+                    secrets=STD_SECRET_HEADER,
+                    now=NOW,
+                    offload=True,
+                )
+
+        asyncio.run(main())
+
+    def test_offload_actually_uses_to_thread(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[object] = []
+        real_to_thread = asyncio.to_thread
+
+        def spy(func, *args, **kwargs):  # noqa: ANN002, ANN003
+            calls.append(func)
+            return real_to_thread(func, *args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", spy)
+
+        async def main() -> None:
+            headers = std_headers()
+            cache = AsyncMemoryReplayCache()
+            await verify_with_replay_async(
+                PAYLOAD, headers, cache, secrets=STD_SECRET_HEADER, now=NOW, offload=True
+            )
+
+        asyncio.run(main())
+        assert calls, "offload=True did not route verification through to_thread"
+
+    def test_offloaded_verification_still_rejects_bad_signatures(self) -> None:
+        async def main() -> None:
+            headers = std_headers()  # valid signature for PAYLOAD...
+            with pytest.raises(SignatureMismatchError):  # ...but not for this body
+                await verify_with_replay_async(
+                    b'{"event":"tampered"}',
+                    headers,
+                    AsyncMemoryReplayCache(),
+                    secrets=STD_SECRET_HEADER,
+                    now=NOW,
+                    offload=True,
+                )
+
+        asyncio.run(main())
+
+    def test_twilio_offload_verifies_and_replays(self) -> None:
+        async def main() -> None:
+            headers = sign_twilio(TWILIO_URL, TWILIO_PARAMS, secret=TWILIO_TOKEN)
+            cache = AsyncMemoryReplayCache()
+            result = await verify_twilio_async(
+                TWILIO_URL,
+                TWILIO_PARAMS,
+                headers,
+                secrets=TWILIO_TOKEN,
+                replay_cache=cache,
+                offload=True,
+            )
+            assert result.provider == "twilio"
+            with pytest.raises(ReplayRejectedError):
+                await verify_twilio_async(
+                    TWILIO_URL,
+                    TWILIO_PARAMS,
+                    headers,
+                    secrets=TWILIO_TOKEN,
+                    replay_cache=cache,
+                    offload=True,
+                )
+
+        asyncio.run(main())

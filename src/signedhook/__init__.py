@@ -70,7 +70,7 @@ from .streaming import StreamingVerifier, verify_stream
 from .twilio import sign_twilio, verify_twilio, verify_twilio_async
 from .verify import UNSET, verify, verify_with_replay, verify_with_replay_async
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 __all__ = [
     "AsyncMemoryReplayCache",

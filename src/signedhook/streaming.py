@@ -48,6 +48,7 @@ from ._errors import (
 )
 from ._providers import detect_provider, get_provider
 from ._providers.base import ParsedSignature, Provider
+from ._replay_check import apply_replay
 from ._settings import Settings
 from ._types import VerificationResult
 from .replay import ReplayCache
@@ -238,20 +239,18 @@ class StreamingVerifier:
         cache = self._replay_cache
         if cache is None:
             return
-        key_id = self._key
-        if key_id is None and self._key_header is not None:
-            key_id = self._headers.get(self._key_header.lower())
-        if key_id is None:
-            key_id = result.message_key
-        if not key_id:
-            raise ConfigurationError(
-                "no replay key available: pass key=, key_header=, or use a scheme that "
-                "signs a message id (standard)"
+        try:
+            apply_replay(
+                cache,
+                result,
+                key=self._key,
+                key_header=self._key_header,
+                headers=self._headers,
+                ttl_seconds=self._ttl_seconds,
             )
-        if cache.seen_within(key_id, self._ttl_seconds):
+        except ReplayRejectedError:
             self._log_failure(result.provider, ReplayRejectedError.code)
-            raise ReplayRejectedError(key_id)
-        cache.remember(key_id, self._ttl_seconds)
+            raise
 
     @staticmethod
     def _log_failure(provider: str, reason_code: str) -> None:

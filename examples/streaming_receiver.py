@@ -8,7 +8,9 @@ Unlike examples/fastapi_receiver.py this endpoint never buffers the whole
 request body: each chunk read from the ASGI stream is fed straight into the
 StreamingVerifier, so a body larger than VERIHOOK_MAX_PAYLOAD_BYTES is
 aborted mid-upload — before the whole thing is read, and before the HMAC
-work for the remaining chunks is done.
+work for the remaining chunks is done. This is the manual, dependency-free
+form of what ``webhook_dependency(..., stream=True)`` now does for you
+(the automatic form also re-injects the body for handlers that need it).
 
     curl -X POST http://localhost:8000/webhooks/large \
       -H "x-hub-signature-256: sha256=..." \

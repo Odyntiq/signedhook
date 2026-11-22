@@ -12,7 +12,10 @@ Then post a Standard Webhooks-style request:
       --data '{"hello":"world"}'
 
 The VERIHOOK_WEBHOOK_SECRET environment variable configures the signing
-secret (whsec_-prefixed base64 or raw). Replace the in-memory replay cache
+secret (whsec_-prefixed base64 or raw). ``stream=True`` verifies the body
+incrementally off the ASGI receive channel (stale timestamps fail before a
+single body byte is read; oversized bodies abort mid-stream) and re-injects
+it, so body parsing works unchanged. Replace the in-memory replay cache
 with a shared implementation for multi-worker deployments.
 """
 
@@ -36,6 +39,7 @@ verify_hook = webhook_dependency(
     secrets=_secret,
     replay_cache=MemoryReplayCache(),
     ttl_seconds=900,
+    stream=True,  # verify chunk by chunk off the ASGI stream
 )
 
 

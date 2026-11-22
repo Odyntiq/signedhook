@@ -12,8 +12,11 @@ Then post a Standard Webhooks-style request:
       --data '{"hello":"world"}'
 
 The VERIHOOK_WEBHOOK_SECRET environment variable configures the signing
-secret (whsec_-prefixed base64 or raw). Replace the in-memory replay cache
-with a shared implementation for multi-worker deployments.
+secret (whsec_-prefixed base64 or raw). ``stream=True`` verifies the body
+incrementally off the WSGI input stream (stale timestamps fail before a
+single body byte is read; oversized bodies abort mid-stream) and still
+re-injects the body, so the view can read it. Replace the in-memory replay
+cache with a shared implementation for multi-worker deployments.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ app = Flask(__name__)
     secrets=SECRET,
     replay_cache=CACHE,
     key_header="webhook-id",
+    stream=True,  # verify chunk by chunk off the WSGI input stream
 )
 def svix_events(result):  # noqa: ANN001 - Flask view injected by the decorator
     """Receive verified Standard Webhooks / Svix deliveries."""
