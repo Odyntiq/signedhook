@@ -33,5 +33,8 @@ class RazorpayProvider(Provider):
     def signed_content(self, payload: bytes, headers: HeaderMap, parsed: ParsedSignature) -> bytes:
         return payload
 
+    def streaming_parts(self, headers: HeaderMap, parsed: ParsedSignature) -> tuple[bytes, bytes]:
+        return b"", b""
+
     def secret_key(self, secret: str) -> bytes:
         return decode_secret(secret, strip_prefix=None, base64_encoded=False)

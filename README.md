@@ -7,10 +7,12 @@ signature headers for the schemes used by Standard Webhooks / Svix, Stripe,
 GitHub (SHA-256 and legacy SHA-1), Slack, Shopify, Razorpay and Twilio —
 plus a configurable generic scheme (any HMAC digest, second- or
 millisecond-based timestamps) for everyone else. Auto-detection, secret
-rotation, timestamp tolerance windows, pluggable replay protection
-(in-memory, Redis and SQLite backends), a retry scheduler for senders and
-an optional FastAPI integration are built in. The core has no third-party
-dependencies and is fully typed (`py.typed`, mypy `--strict` clean).
+rotation, timestamp tolerance windows, pluggable replay protection (sync
+and async; in-memory, Redis and SQLite backends), incremental streaming
+verification for very large bodies, a retry scheduler for senders and
+optional FastAPI / Django / Flask integrations are built in. The core has
+no third-party dependencies and is fully typed (`py.typed`, mypy
+`--strict` clean).
 
 ## The problem
 
@@ -43,8 +45,12 @@ adapters on top**.
 - **Secret rotation** — pass an ordered secret list; the first secret that
   verifies wins and its index is reported.
 - **Replay defense** — timestamp tolerance windows (default 300s, symmetric)
-  plus a `ReplayCache` protocol for message-id dedupe, with thread-safe
-  in-memory, Redis and SQLite backends bundled.
+  plus sync and async `ReplayCache` protocols for message-id dedupe, with
+  thread-safe in-memory, Redis and SQLite backends bundled.
+- **Streaming verification** — `StreamingVerifier` checks very large bodies
+  chunk by chunk with the size limit enforced mid-stream.
+- **Framework integrations** — optional FastAPI dependency, Django
+  middleware and Flask decorator with identical structured error mapping.
 - **Sender-side signing** — `sign()` produces Standard Webhooks headers for
   round-trip testing and your own emitters.
 - **Retry scheduler** — `RetryPolicy` gives jittered exponential backoff for
@@ -54,7 +60,7 @@ adapters on top**.
 - **Optional FastAPI integration** — a dependency factory that turns
   verification failures into structured HTTP errors (400/401/409/413).
 - **CLI** — `signedhook providers | sign | verify` for debugging and CI.
-- **Quality gates** — pytest (234 tests), ruff, mypy `--strict`, pip-audit,
+- **Quality gates** — pytest (322 tests), ruff, mypy `--strict`, pip-audit,
   CI on Python 3.10–3.13.
 
 ## Provider support matrix
@@ -74,6 +80,8 @@ adapters on top**.
 Built-in schemes use HMAC-SHA256 except GitHub legacy and Twilio (HMAC-SHA1,
 per those providers' published schemes); `GenericHMAC` additionally offers
 SHA-384 and SHA-512. Signatures are always compared in constant time.
+Every body-signing scheme in the table also supports streaming verification;
+Twilio does not (it signs the request URL and form parameters, not the body).
 
 ## Architecture
 
@@ -92,22 +100,24 @@ VerificationResult ------- provider, timestamp, matched secret index,
 ```
 
 Modules: `verify` (entry point), `_providers/*` (schemes + registry),
-`_encoding` (decode/compare helpers), `replay` (cache protocol),
-`replay_backends` (Redis / SQLite shared caches), `twilio` (URL + params
-scheme), `retry` (sender backoff), `signing` (sender side), `fastapi`
-(optional integration), `cli` (shell interface), `_settings` (limits, env
-support).
+`_encoding` (decode/compare helpers), `replay` (cache protocols),
+`replay_backends` (Redis / SQLite shared caches, sync and async),
+`streaming` (incremental verification), `twilio` (URL + params scheme),
+`retry` (sender backoff), `signing` (sender side), `fastapi` / `django` /
+`flask` (optional integrations), `_http` (shared status mapping), `cli`
+(shell interface), `_settings` (limits, env support).
 
 ## Installation
 
 ```bash
 pip install signedhook
 
-# with the FastAPI integration
-pip install signedhook[fastapi]
-
-# with the Redis replay backend (SQLite is stdlib-only, no extra needed)
-pip install signedhook[redis]
+# optional integrations and backends
+pip install "signedhook[fastapi]"    # FastAPI dependency factory
+pip install "signedhook[django]"     # Django middleware
+pip install "signedhook[flask]"      # Flask view decorator
+pip install "signedhook[redis]"      # Redis replay caches (sync + async)
+pip install "signedhook[aiosqlite]"  # async SQLite replay cache
 ```
 
 Python 3.10+. No dependencies required for the core.
@@ -165,6 +175,27 @@ print(result.provider)  # "twilio"
 Pass `replay_cache=` for dedupe; the key defaults to a SHA-256 of the
 string-to-sign, stable for identical deliveries.
 
+### Streaming very large bodies
+
+Every body-signing scheme signs `prefix + payload + suffix` where the
+wrapper bytes come from headers, so verification can run *while the body
+is still arriving* — the payload never has to be buffered whole, and the
+size limit aborts oversized deliveries mid-stream:
+
+```python
+from signedhook import StreamingVerifier
+
+verifier = StreamingVerifier(headers, secrets=SECRET, provider="stripe")
+async for chunk in request.stream():
+    verifier.feed(chunk)  # raises PayloadTooLargeError past the limit
+result = verifier.finish()  # same VerificationResult as verify()
+```
+
+Headers are parsed, the tolerance window checked and the HMAC states
+primed at construction — so unauthenticated requests fail before a single
+body byte is read. `verify_stream(chunks_or_body, headers, ...)` wraps the
+same flow for callers with an iterable (or a complete body).
+
 ### FastAPI receiver
 
 ```python
@@ -189,6 +220,58 @@ Failures become structured HTTP errors:
 400 (malformed), 401 (unauthenticated), 409 (replayed), 413 (too large).
 
 A runnable example lives in [`examples/fastapi_receiver.py`](examples/fastapi_receiver.py).
+
+`replay_cache=` also accepts an async cache (`AsyncReplayCache`); it is
+detected and awaited automatically.
+
+### Flask receiver
+
+```python
+from flask import Flask
+from signedhook.flask import verify_webhook
+
+app = Flask(__name__)
+
+
+@app.post("/webhooks/stripe")
+@verify_webhook(provider="stripe", secrets=STRIPE_SECRET)
+def stripe_events(result):
+    return {"verified_provider": result.provider}
+```
+
+Failures return the same structured JSON (`{"detail": {"code", "message"}}`)
+with the same status codes as the FastAPI integration.
+
+### Django middleware
+
+```python
+# settings.py
+MIDDLEWARE = [
+    # ... before django.middleware.csrf.CsrfViewMiddleware
+    "signedhook.django.WebhookMiddleware",
+]
+
+SIGNEDHOOK_ROUTES = {
+    "/webhooks/stripe/": {
+        "provider": "stripe",
+        "secrets": ["env:STRIPE_WEBHOOK_SECRET"],
+    },
+    "/webhooks/github/": {
+        "provider": "github",
+        "secrets": "env:GITHUB_WEBHOOK_SECRET",
+        "replay": True,
+        "key_header": "x-github-delivery",
+    },
+}
+```
+
+Matching requests are verified before the view runs; the result is
+attached as `request.signedhook_result` and the CSRF check is skipped for
+verified deliveries (webhooks carry no CSRF token). `env:NAME` secrets
+resolve at startup and fail fast; non-matching paths pass through with a
+dict lookup. Per-route options: `provider`, `secrets`, `tolerance`,
+`max_payload_bytes`, `replay` / `replay_cache` (instance or factory),
+`key_header`, `ttl_seconds`.
 
 ### CLI
 
@@ -250,27 +333,40 @@ own message id (`webhook-id` for Standard Webhooks). Signature verification
 runs **first** — only verified messages consume cache entries, so
 unauthenticated traffic cannot poison the cache.
 
-`MemoryReplayCache` is process-local. For multi-worker deployments two
-shared backends ship in the box:
+`MemoryReplayCache` is process-local. For multi-worker deployments shared
+backends ship in the box — sync and async:
 
 ```python
-from signedhook import RedisReplayCache, SQLiteReplayCache, verify_with_replay
+from signedhook import (
+    RedisReplayCache,
+    SQLiteReplayCache,
+    verify_with_replay,
+    AsyncRedisReplayCache,
+    AsyncSQLiteReplayCache,
+    verify_with_replay_async,
+)
+from redis import asyncio as aioredis
 
-# any Redis-compatible client (redis-py, Valkey, KeyDB): atomic per operation
+# sync: any Redis-compatible client (redis-py, Valkey, KeyDB)
 cache = RedisReplayCache(redis_client, namespace="myapp:replay")
+result = verify_with_replay(payload, headers, cache, secrets=WHSEC)
 
 # stdlib-only, single host: pass the same path in every worker
 cache = SQLiteReplayCache("/var/lib/myapp/replay.sqlite3")
 
-result = verify_with_replay(payload, headers, cache, secrets=WHSEC)
+# asyncio: async twins of both backends
+cache = AsyncRedisReplayCache(aioredis.Redis(host="redis.internal"))
+cache = await AsyncSQLiteReplayCache.connect("/var/lib/myapp/replay.sqlite3")
+result = await verify_with_replay_async(payload, headers, cache, secrets=WHSEC)
 ```
 
-`RedisReplayCache` needs any Redis-compatible client
-(`pip install signedhook[redis]`); each operation is a single atomic Redis
-command, so racing workers stay consistent. `SQLiteReplayCache` uses WAL
-mode with a busy timeout and needs no server — ideal for gunicorn/uvicorn
-workers on one machine. Or implement the two-method `ReplayCache` protocol
-against your own database.
+The Redis backends run each operation as a single atomic Redis command, so
+racing workers stay consistent; the SQLite backends use WAL mode with a
+busy timeout and need no server — ideal for gunicorn/uvicorn workers on
+one machine. The async entry points keep signature verification
+synchronous and only await the two cache operations, so the event loop is
+never blocked. Or implement the two-method `ReplayCache` /
+`AsyncReplayCache` protocols against your own database.
 
 ## API overview
 
@@ -278,14 +374,21 @@ against your own database.
 |---|---|
 | `verify(payload, headers, *, secrets, provider="auto", tolerance=UNSET, now=None, settings=None)` | Verify a webhook; raises typed errors |
 | `verify_with_replay(..., cache, key=None, key_header=None, ttl_seconds=900)` | Verify + dedupe |
+| `verify_with_replay_async(..., cache, ...)` | Async-cache variant of the above |
+| `StreamingVerifier(headers, *, secrets, ...)` / `.feed(chunk)` / `.finish()` | Incremental verification for large bodies |
+| `verify_stream(chunks_or_body, headers, *, secrets, ...)` | One-shot streaming convenience |
 | `verify_twilio(url, params, headers, *, secrets, replay_cache=None, key=None, ttl_seconds=900)` | Verify Twilio (URL + params scheme) |
+| `verify_twilio_async(...)` | Async-cache variant of the above |
 | `sign(payload, *, secret, webhook_id, now=None, scheme="standard")` | Produce sender headers |
 | `sign_twilio(url, params, *, secret)` | Produce Twilio signature headers |
 | `RetryPolicy(...).delays()` | Jittered backoff schedule |
 | `list_providers()` / `get_provider(name)` / `register_provider(provider)` | Registry |
 | `GenericHMAC(name, sig_header, sig_prefix, encoding, secret_prefix, base64_secrets, ts_header, signed_template, message_key_header, digest, ts_unit)` | Custom schemes (any digest, seconds/milliseconds) |
-| `MemoryReplayCache` / `RedisReplayCache` / `SQLiteReplayCache` | Replay caches (process-local / Redis / SQLite) |
+| `MemoryReplayCache` / `RedisReplayCache` / `SQLiteReplayCache` | Sync replay caches (process-local / Redis / SQLite) |
+| `AsyncMemoryReplayCache` / `AsyncRedisReplayCache` / `AsyncSQLiteReplayCache` | Async replay caches |
 | `webhook_dependency(...)` (`signedhook.fastapi`) | FastAPI dependency factory |
+| `verify_webhook(...)` (`signedhook.flask`) | Flask view decorator |
+| `WebhookMiddleware` (`signedhook.django`) | Django middleware |
 
 Errors (all subclasses of `SignedhookError`, each with a stable `.code`):
 `ConfigurationError`, `PayloadTooLargeError`, `MissingHeaderError`,
@@ -300,7 +403,7 @@ signatures, secrets or payloads.
 
 ```bash
 pip install -e ".[dev]"
-pytest              # 234 tests
+pytest              # 322 tests
 ruff check .
 ruff format --check .
 mypy                # --strict, src only
@@ -333,18 +436,25 @@ public issues for security reports.
 
 ## Roadmap
 
-- Django middleware, Flask decorator.
-- Optional payload-size-aware streaming verification for very large bodies.
-- Async replay-cache adapters for the shared backends.
+- More built-in provider schemes (GitLab, Square, Discourse-style
+  raw-secret HMAC) as demand warrants.
+- Streaming support inside the framework integrations (feed chunks
+  directly from ASGI/WSGI request streams).
 
 ## Limitations
 
-- `MemoryReplayCache` is process-local; use `RedisReplayCache` (any host) or
-  `SQLiteReplayCache` (single host) for multi-worker deployments.
-- Twilio verification needs the original request URL, so it goes through
-  `verify_twilio` rather than the body-only `verify()` pipeline.
-- `SQLiteReplayCache` shares state per database file; multi-host clusters
-  should use `RedisReplayCache`.
+- `MemoryReplayCache` is process-local; use the Redis or SQLite backends
+  (sync or async) for multi-worker deployments.
+- Streaming verification covers every body-signing scheme; Twilio cannot
+  stream because it signs the request URL and form parameters, not the
+  body.
+- The Django middleware and Flask decorator read the full body before
+  verifying (framework request objects buffer it); for hard pre-HMAC size
+  limits use the web server's request-size cap or the FastAPI integration
+  fed from a streaming body.
+- The async entry points await only the replay-cache operations; HMAC
+  computation is CPU-bound and runs inline (it is fast — microseconds for
+  typical webhook sizes).
 
 ## Contributing
 

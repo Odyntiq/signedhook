@@ -22,7 +22,8 @@ import os
 
 from fastapi import Depends, FastAPI
 
-from signedhook import MemoryReplayCache, VerificationResult, webhook_dependency
+from signedhook import MemoryReplayCache, VerificationResult
+from signedhook.fastapi import webhook_dependency
 
 app = FastAPI(title="signedhook receiver example")
 

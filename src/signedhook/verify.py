@@ -23,9 +23,15 @@ from ._errors import (
 from ._providers import detect_provider, get_provider
 from ._settings import Settings
 from ._types import VerificationResult
-from .replay import ReplayCache
+from .replay import AsyncReplayCache, ReplayCache
 
-__all__ = ["UNSET", "UnsetType", "verify", "verify_with_replay"]
+__all__ = [
+    "UNSET",
+    "UnsetType",
+    "verify",
+    "verify_with_replay",
+    "verify_with_replay_async",
+]
 
 logger = logging.getLogger("signedhook.verify")
 
@@ -184,10 +190,71 @@ def verify_with_replay(
         now=now,
         settings=settings,
     )
-    lowered = _normalize_headers(headers)
+    key_id = _resolve_replay_key(key, key_header, headers, result)
+    if cache.seen_within(key_id, ttl_seconds):
+        raise ReplayRejectedError(key_id)
+    cache.remember(key_id, ttl_seconds)
+    return result
+
+
+async def verify_with_replay_async(
+    payload: bytes,
+    headers: Mapping[str, str],
+    cache: AsyncReplayCache,
+    *,
+    secrets: str | Sequence[str],
+    provider: str | None = "auto",
+    tolerance: int | None | UnsetType = UNSET,
+    now: int | None = None,
+    settings: Settings | None = None,
+    key: str | None = None,
+    key_header: str | None = None,
+    ttl_seconds: float = 900,
+) -> VerificationResult:
+    """Awaitable :func:`verify_with_replay` for asyncio applications.
+
+    Signature verification runs synchronously (it is pure CPU work over an
+    already-buffered body); only the two cache operations are awaited, so
+    async stores such as :class:`~signedhook.replay_backends.
+    AsyncRedisReplayCache` integrate without blocking the event loop. The
+    verify-first ordering is preserved: unauthenticated traffic never
+    touches the cache.
+
+    Args:
+        cache: any object implementing the :class:`AsyncReplayCache`
+            protocol (``await seen_within(...)`` / ``await remember(...)``).
+
+    See :func:`verify_with_replay` for all other parameters and raised
+    errors; the two calls are behaviourally identical.
+    """
+    result = verify(
+        payload,
+        headers,
+        secrets=secrets,
+        provider=provider,
+        tolerance=tolerance,
+        now=now,
+        settings=settings,
+    )
+    key_id = _resolve_replay_key(key, key_header, headers, result)
+    if await cache.seen_within(key_id, ttl_seconds):
+        raise ReplayRejectedError(key_id)
+    await cache.remember(key_id, ttl_seconds)
+    return result
+
+
+def _resolve_replay_key(
+    key: str | None,
+    key_header: str | None,
+    headers: Mapping[str, str],
+    result: VerificationResult,
+) -> str:
+    """Resolve the replay dedupe key: explicit key → header → message id."""
     key_id = key
     if key_id is None and key_header is not None:
-        key_id = lowered.get(key_header.lower())
+        key_id = {str(name).lower(): value for name, value in headers.items()}.get(
+            key_header.lower()
+        )
     if key_id is None:
         key_id = result.message_key
     if not key_id:
@@ -195,7 +262,4 @@ def verify_with_replay(
             "no replay key available: pass key=, key_header=, or use a scheme that "
             "signs a message id (standard)"
         )
-    if cache.seen_within(key_id, ttl_seconds):
-        raise ReplayRejectedError(key_id)
-    cache.remember(key_id, ttl_seconds)
-    return result
+    return key_id

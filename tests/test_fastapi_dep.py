@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI  # noqa: E402
 
 from conftest import NOW, PAYLOAD, STD_SECRET_HEADER, std_headers  # noqa: E402
 from signedhook import (  # noqa: E402
+    AsyncMemoryReplayCache,
     MemoryReplayCache,
     Settings,
     SignatureMismatchError,
@@ -104,3 +105,32 @@ def test_auto_provider_mode_works() -> None:
     response = client.post("/hook", content=PAYLOAD, headers=std_headers())
     assert response.status_code == 200
     assert response.json() == {"provider": "standard"}
+
+
+def test_async_replay_cache_is_awaited() -> None:
+    # An AsyncReplayCache must be detected and awaited rather than called
+    # synchronously — the second delivery is rejected with 409.
+    client = build_app(
+        provider="standard",
+        secrets=STD_SECRET_HEADER,
+        now=NOW,
+        replay_cache=AsyncMemoryReplayCache(),
+    )
+    first = client.post("/hook", content=PAYLOAD, headers=std_headers())
+    assert first.status_code == 200
+    second = client.post("/hook", content=PAYLOAD, headers=std_headers())
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "replay_rejected"
+
+
+def test_async_cache_never_blocks_unauthenticated_traffic() -> None:
+    cache = AsyncMemoryReplayCache()
+    client = build_app(
+        provider="standard",
+        secrets=STD_SECRET_HEADER,
+        now=NOW,
+        replay_cache=cache,
+    )
+    response = client.post("/hook", content=b"tampered", headers=std_headers())
+    assert response.status_code == 401
+    assert len(cache) == 0

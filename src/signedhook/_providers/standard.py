@@ -61,5 +61,12 @@ class StandardWebhooksProvider(Provider):
             + payload
         )
 
+    def streaming_parts(self, headers: HeaderMap, parsed: ParsedSignature) -> tuple[bytes, bytes]:
+        webhook_id = _require(headers, "webhook-id")
+        if parsed.timestamp is None:
+            raise ConfigurationError("standard scheme requires a signed timestamp")
+        prefix = webhook_id.encode("utf-8") + b"." + str(parsed.timestamp).encode("ascii") + b"."
+        return prefix, b""
+
     def secret_key(self, secret: str) -> bytes:
         return decode_secret(secret, strip_prefix="whsec_", base64_encoded=None)

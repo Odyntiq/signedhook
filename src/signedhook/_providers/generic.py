@@ -153,6 +153,17 @@ class GenericHMAC(Provider):
             template = template.replace("{ts}", str(parsed.timestamp))
         return _apply_template(template, payload)
 
+    def streaming_parts(self, headers: HeaderMap, parsed: ParsedSignature) -> tuple[bytes, bytes]:
+        template = self._signed_template
+        if "{ts}" in template:
+            if parsed.timestamp is None:
+                raise ConfigurationError("scheme signs a timestamp but none was parsed")
+            template = template.replace("{ts}", str(parsed.timestamp))
+        before, sep, after = template.partition("{payload}")
+        if not sep:  # pragma: no cover - guarded by __init__ validation
+            raise ConfigurationError("signed_template must contain the {payload} placeholder")
+        return before.encode("utf-8"), after.encode("utf-8")
+
     def secret_key(self, secret: str) -> bytes:
         return decode_secret(
             secret, strip_prefix=self._secret_prefix, base64_encoded=self._base64_secrets

@@ -66,5 +66,10 @@ class StripeProvider(Provider):
             raise InvalidHeaderFormatError(self.signature_header, "missing t= timestamp component")
         return str(parsed.timestamp).encode("ascii") + b"." + payload
 
+    def streaming_parts(self, headers: HeaderMap, parsed: ParsedSignature) -> tuple[bytes, bytes]:
+        if parsed.timestamp is None:
+            raise InvalidHeaderFormatError(self.signature_header, "missing t= timestamp component")
+        return str(parsed.timestamp).encode("ascii") + b".", b""
+
     def secret_key(self, secret: str) -> bytes:
         return decode_secret(secret, strip_prefix="whsec_", base64_encoded=False)

@@ -80,6 +80,22 @@ class Provider(ABC):
     def signed_content(self, payload: bytes, headers: HeaderMap, parsed: ParsedSignature) -> bytes:
         """Reconstruct the exact byte string the provider signed."""
 
+    def streaming_parts(self, headers: HeaderMap, parsed: ParsedSignature) -> tuple[bytes, bytes]:
+        """Split the signed content into ``(prefix, suffix)`` around the payload.
+
+        The concatenation ``prefix + payload + suffix`` must equal
+        :meth:`signed_content` byte for byte. Body-only schemes can always do
+        this (their templates wrap the payload with header-derived bytes),
+        which is what makes incremental verification possible: the HMAC state
+        is initialised with the prefix, updated per received chunk and
+        finalised with the suffix — the payload never has to be buffered
+        whole. Providers that cannot decompose their signed content (Twilio
+        signs the request URL and form parameters) keep this default and
+        :class:`~signedhook.streaming.StreamingVerifier` rejects them with a
+        precise error.
+        """
+        raise ConfigurationError(f"provider {self.name!r} does not support streaming verification")
+
     @abstractmethod
     def secret_key(self, secret: str) -> bytes:
         """Decode one caller-provided secret into raw HMAC key bytes."""

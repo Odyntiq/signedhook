@@ -3,6 +3,58 @@
 All notable changes to signedhook are documented here. The format follows
 Keep a Changelog; versioning follows Semantic Versioning.
 
+## [1.2.0] — 2026-11-23
+
+Framework integrations, async replay protection and streaming verification —
+the full 1.0.0 roadmap, delivered.
+
+### Added
+
+- **Streaming verification** — `StreamingVerifier` and `verify_stream()`
+  verify body-signed webhooks incrementally, chunk by chunk. Every built-in
+  body scheme decomposes its signed content into `(prefix, payload, suffix)`
+  via the new `Provider.streaming_parts()` hook, so the per-secret HMAC
+  states are primed from headers alone, updated per chunk and finalised at
+  body end. The payload-size limit is enforced *during* feeding (oversized
+  deliveries abort mid-stream instead of after full buffering) and stale
+  timestamps are rejected at construction, before any body byte is read.
+  Equivalent to `verify()` by construction; equivalence is pinned by tests
+  comparing both paths for every scheme at multiple chunk boundaries.
+- **Async replay protection** — `AsyncReplayCache` protocol,
+  `verify_with_replay_async()` and `verify_twilio_async()`. Signature
+  verification stays synchronous (pure CPU); only the two cache operations
+  are awaited, so async stores never block the event loop. Verify-first
+  ordering preserved: unauthenticated traffic never touches the cache.
+- **Async shared backends** — `AsyncRedisReplayCache` (any client with
+  async `set`/`get`/`delete`, e.g. `redis.asyncio`) and
+  `AsyncSQLiteReplayCache` (via `await AsyncSQLiteReplayCache.connect(path)`
+  with the `signedhook[aiosqlite]` extra; same WAL schema as the sync twin).
+  `AsyncMemoryReplayCache` wraps the thread-safe in-memory cache for
+  single-process asyncio apps and can share state with sync code.
+- **FastAPI: async caches** — `webhook_dependency(replay_cache=...)` now
+  accepts an `AsyncReplayCache`; async caches are detected and awaited
+  automatically.
+- **Flask integration** (`signedhook[flask]`) — the `verify_webhook()`
+  view decorator reads the raw body, verifies, injects the
+  `VerificationResult` into the view and returns structured JSON errors
+  (`{"detail": {"code", "message"}}`) with the shared status mapping.
+- **Django integration** (`signedhook[django]`) — `WebhookMiddleware`
+  verifies the routes declared in `settings.SIGNEDHOOK_ROUTES` before the
+  view runs, attaches `request.signedhook_result`, disables the CSRF check
+  for verified deliveries, and returns the same structured JSON errors.
+  Per-route options: `provider`, `secrets` (with `env:NAME` resolution at
+  startup), `tolerance`, `max_payload_bytes`, `replay` /
+  `replay_cache` (instance or factory), `key_header`, `ttl_seconds`;
+  unknown options and missing environment variables fail fast at boot.
+- Shared HTTP error mapping (`_http.resolve_status`) used by all three
+  integrations, so statuses cannot drift between frameworks.
+
+### Changed
+
+- `Provider` gained a concrete `streaming_parts()` default that rejects
+  schemes whose signed content cannot be decomposed (Twilio) with a precise
+  error. Existing custom providers are unaffected.
+
 ## [1.1.0] — 2026-11-22
 
 Provider coverage and multi-worker replay protection.

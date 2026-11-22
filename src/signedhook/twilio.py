@@ -36,13 +36,14 @@ from ._errors import (
 )
 from ._providers.base import HeaderMap, ParsedSignature, Provider
 from ._types import VerificationResult
-from .replay import ReplayCache
+from .replay import AsyncReplayCache, ReplayCache
 
 __all__ = [
     "TwilioProvider",
     "sign_twilio",
     "twilio_string_to_sign",
     "verify_twilio",
+    "verify_twilio_async",
 ]
 
 logger = logging.getLogger("signedhook.verify")
@@ -160,38 +161,7 @@ def verify_twilio(
             replay window.
         ConfigurationError: invalid secrets or an empty URL.
     """
-    lowered = {str(name).lower(): value for name, value in headers.items()}
-    raw = lowered.get(_SIGNATURE_HEADER)
-    if raw is None:
-        raise MissingHeaderError(_SIGNATURE_HEADER)
-    provided = _decode_base64(raw.strip())
-
-    string_to_sign = twilio_string_to_sign(url, params)
-    content = string_to_sign.encode("utf-8")
-
-    secret_values = normalize_secret_values(secrets)
-    result: VerificationResult | None = None
-    for position, value in enumerate(secret_values):
-        token = decode_secret(value, strip_prefix=None, base64_encoded=False)
-        expected = canonical_hmac(token, content, "sha1")
-        if constant_time_eq(expected, provided):
-            result = VerificationResult(
-                provider="twilio",
-                scheme="hmac-sha1",
-                timestamp=None,
-                matched_secret_index=position,
-                message_key=None,
-                payload_size=_form_encoded_size(params),
-            )
-            break
-
-    if result is None:
-        logger.debug(
-            "webhook verification failed",
-            extra={"provider": "twilio", "outcome": "failure", "reason_code": "signature_mismatch"},
-        )
-        raise SignatureMismatchError("twilio")
-
+    result, content = _twilio_signature_check(url, params, headers, secrets=secrets)
     if replay_cache is not None:
         dedupe_key = key or hashlib.sha256(content).hexdigest()
         if replay_cache.seen_within(dedupe_key, ttl_seconds):
@@ -205,7 +175,6 @@ def verify_twilio(
             )
             raise ReplayRejectedError(dedupe_key)
         replay_cache.remember(dedupe_key, ttl_seconds)
-
     logger.debug(
         "webhook verified",
         extra={
@@ -216,6 +185,91 @@ def verify_twilio(
         },
     )
     return result
+
+
+async def verify_twilio_async(
+    url: str,
+    params: Mapping[str, str] | Sequence[tuple[str, str]],
+    headers: Mapping[str, str],
+    *,
+    secrets: str | Sequence[str],
+    replay_cache: AsyncReplayCache | None = None,
+    key: str | None = None,
+    ttl_seconds: float = 900,
+) -> VerificationResult:
+    """Awaitable :func:`verify_twilio` for asyncio applications.
+
+    Signature verification runs synchronously (pure CPU work); only the two
+    cache operations are awaited, so async stores such as
+    :class:`~signedhook.replay_backends.AsyncRedisReplayCache` integrate
+    without blocking the event loop. See :func:`verify_twilio` for the
+    arguments and raised errors; the two calls are behaviourally identical.
+    """
+    result, content = _twilio_signature_check(url, params, headers, secrets=secrets)
+    if replay_cache is not None:
+        dedupe_key = key or hashlib.sha256(content).hexdigest()
+        if await replay_cache.seen_within(dedupe_key, ttl_seconds):
+            logger.debug(
+                "webhook verification failed",
+                extra={
+                    "provider": "twilio",
+                    "outcome": "failure",
+                    "reason_code": "replay_rejected",
+                },
+            )
+            raise ReplayRejectedError(dedupe_key)
+        await replay_cache.remember(dedupe_key, ttl_seconds)
+    logger.debug(
+        "webhook verified",
+        extra={
+            "provider": "twilio",
+            "outcome": "success",
+            "reason_code": "",
+            "matched_secret_index": result.matched_secret_index,
+        },
+    )
+    return result
+
+
+def _twilio_signature_check(
+    url: str,
+    params: Mapping[str, str] | Sequence[tuple[str, str]],
+    headers: Mapping[str, str],
+    *,
+    secrets: str | Sequence[str],
+) -> tuple[VerificationResult, bytes]:
+    """Shared sync verification core; returns ``(result, signed_bytes)``."""
+    lowered = {str(name).lower(): value for name, value in headers.items()}
+    raw = lowered.get(_SIGNATURE_HEADER)
+    if raw is None:
+        raise MissingHeaderError(_SIGNATURE_HEADER)
+    provided = _decode_base64(raw.strip())
+
+    string_to_sign = twilio_string_to_sign(url, params)
+    content = string_to_sign.encode("utf-8")
+
+    secret_values = normalize_secret_values(secrets)
+    for position, value in enumerate(secret_values):
+        token = decode_secret(value, strip_prefix=None, base64_encoded=False)
+        expected = canonical_hmac(token, content, "sha1")
+        if constant_time_eq(expected, provided):
+            return (
+                VerificationResult(
+                    provider="twilio",
+                    scheme="hmac-sha1",
+                    timestamp=None,
+                    matched_secret_index=position,
+                    message_key=None,
+                    payload_size=_form_encoded_size(params),
+                ),
+                content,
+            )
+
+    logger.debug(
+        "webhook verification failed",
+        extra={"provider": "twilio", "outcome": "failure", "reason_code": "signature_mismatch"},
+    )
+    raise SignatureMismatchError("twilio")
 
 
 def sign_twilio(
